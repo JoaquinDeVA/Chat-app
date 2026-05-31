@@ -1,0 +1,30 @@
+# ── Backend Java ─────────────────────────────────────────────────────────────
+backend-java/target/
+
+# Local development configuration with real credentials — never commit this
+backend-java/src/main/resources/application-dev.properties
+backend-java/src/main/resources/application-prod.properties
+
+# ── Server Rust ───────────────────────────────────────────────────────────────
+server-rust/target/
+server-rust/Cargo.lock
+
+# ── Client C ─────────────────────────────────────────────────────────────────
+client-c/cli7
+client-c/*.o
+
+# ── Client Python ─────────────────────────────────────────────────────────────
+client-python/__pycache__/
+client-python/*.pyc
+client-python/chats/
+
+# ── Scratch / dev-only files ──────────────────────────────────────────────────
+dev.txt
+
+# ── Claude Code local settings ────────────────────────────────────────────────
+.claude/
+
+# ── OS / editor ───────────────────────────────────────────────────────────────
+.DS_Store
+*.swp
+*.swo
