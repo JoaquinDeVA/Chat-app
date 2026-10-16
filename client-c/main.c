@@ -1,465 +1,352 @@
+/*
+ * main.c - the chat client: screens and key handling on top of the network, protocol and
+ * session modules.
+ */
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <time.h>
-#include <ncurses.h>
-#include "protocol.h"
+
+#include "config.h"
+#include "json.h"
 #include "network.h"
-#include "app_state.h"
+#include "protocol.h"
+#include "session.h"
 #include "tui.h"
 
-#define CONFIG_FILE "config.txt"
+#define REPLY_TIMEOUT_MS 5000
+#define DELTA_TIMEOUT_MS 10000
+#define POLL_INTERVAL_MS 100
 
-// Lee ip y puerto del config.txt
-// Formato: "ip = x.x.x.x" y "puerto = XXXX"
-//prueba de comentarios
-static int load_config(char *ip, size_t ip_sz, int *port)
+static const char *environment(const char *name)
 {
-    FILE *f = fopen(CONFIG_FILE, "r");
-    if (!f) {
-        fprintf(stderr, "No se encontro %s\n", CONFIG_FILE);
-        return -1;
-    }
-
-    char line[256];
-    while (fgets(line, sizeof(line), f)) {
-        if (line[0] == '#' || line[0] == '\n') continue;
-
-        char key[64], val[128];
-        if (sscanf(line, " %63[^=] = %127s", key, val) != 2) continue;
-
-        char *end = key + strlen(key) - 1;
-        while (end > key && *end == ' ') *end-- = '\0';
-
-        if (strcmp(key, "ip") == 0)
-            strncpy(ip, val, ip_sz - 1);
-        else if (strcmp(key, "puerto") == 0)
-            *port = atoi(val);
-    }
-
-    fclose(f);
-    return 0;
+    return getenv(name);
 }
 
-// Estado global. En heap porque es demasiado grande para el stack.
+typedef enum { STATE_AUTH, STATE_LIVE, STATE_EXIT } AppState;
+typedef enum { AUTH_MENU, AUTH_LOGIN, AUTH_REGISTER } AuthMode;
+typedef enum { LIVE_NAVIGATION, LIVE_INPUT, LIVE_NEWCHAT } LiveMode;
+
+/* Too big for the stack, so it lives on the heap. */
 typedef struct {
     NetworkClient net;
-    AppSession    session;
-    TUI           tui;
-    AppState      state;
-    AuthMode      auth_mode;
-    LiveMode      live_mode;
-    int           connected;
-    char          connect_err[256];
-    int           needs_redraw;
-    char          ip[64];
-    int           port;
+    Session session;
+    TUI tui;
+    ServerAddress address;
+    AppState state;
+    AuthMode auth_mode;
+    LiveMode live_mode;
+    int connected;
+    char connect_error[256];
+    int needs_redraw;
 } App;
 
+/* Connects and opens the conversation with the protocol version this client speaks. */
 static int app_connect(App *a)
 {
-    if (net_connect(&a->net, a->ip, a->port) < 0) {
-        snprintf(a->connect_err, sizeof(a->connect_err),
-                 "No se pudo conectar a %s:%d", a->ip, a->port);
-        a->connected = 0;
+    char buf[BUF_SIZE], reason[200];
+    char *reply;
+
+    a->connected = 0;
+    if (net_connect(&a->net, a->address.host, a->address.port) < 0) {
+        snprintf(a->connect_error, sizeof(a->connect_error), "cannot reach %s:%d", a->address.host,
+                 a->address.port);
         return -1;
     }
-    a->connected      = 1;
-    a->connect_err[0] = '\0';
+    if (proto_hello(buf, sizeof(buf)) < 0 || net_send(&a->net, buf) < 0 ||
+        (reply = net_recv(&a->net, REPLY_TIMEOUT_MS)) == NULL) {
+        snprintf(a->connect_error, sizeof(a->connect_error), "the server did not answer hello");
+        net_close(&a->net);
+        return -1;
+    }
+    if (!proto_reply_ok(reply)) {
+        proto_reply_message(reply, reason, sizeof(reason), "hello refused");
+        snprintf(a->connect_error, sizeof(a->connect_error), "%s (this client speaks protocol v%d)", reason,
+                 PROTOCOL_VERSION);
+        free(reply);
+        net_close(&a->net);
+        return -1;
+    }
+    free(reply);
+    a->connected = 1;
+    a->connect_error[0] = '\0';
     return 0;
 }
 
-// Manda JSON y espera respuesta. Loguea a stderr para debug.
-static char *send_recv(App *a, const char *msg)
+/* Sends a request and waits for the reply; malloc'd, NULL on timeout or if it cannot be sent. */
+static char *request(App *a, const char *json, int timeout_ms)
 {
-    fprintf(stderr, "[SEND] %s\n", msg);
-    net_send(&a->net, msg);
-    char *resp = net_recv(&a->net, 5000);
-    fprintf(stderr, "[RECV] %s\n", resp ? resp : "NULL");
-    return resp;
+    if (net_send(&a->net, json) < 0)
+        return NULL;
+    return net_recv(&a->net, timeout_ms);
 }
 
-// El servidor usa "processed":1 para operaciones normales
-// y "code":1 para login. Ambos significan OK.
-static int resp_ok(const char *json)
+/* ── authentication ──────────────────────────────────────────────────────────────────────── */
+
+static void load_history(App *a)
 {
-    if (!json) return 0;
+    char buf[BUF_SIZE];
+    char *reply;
+    char *stale;
 
-    const char *p = strstr(json, "\"processed\"");
-    if (p) {
-        p += strlen("\"processed\"");
-        while (*p == ' ' || *p == ':' || *p == '\n' || *p == '\r') p++;
-        if (*p == '1' || strncmp(p, "true", 4) == 0)
-            return 1;
+    while ((stale = net_try_recv(&a->net)) != NULL) /* nothing received so far answers the request */
+        free(stale);
+    if (proto_load_delta(buf, sizeof(buf), EPOCH) < 0)
+        return;
+    reply = request(a, buf, DELTA_TIMEOUT_MS);
+    if (reply) {
+        session_apply_delta(&a->session, reply);
+        free(reply);
     }
-
-    const char *c = strstr(json, "\"code\"");
-    if (c) {
-        c += strlen("\"code\"");
-        while (*c == ' ' || *c == ':' || *c == '\n' || *c == '\r') c++;
-        if (*c == '1') return 1;
-    }
-
-    return 0;
 }
 
-// Procesa un mensaje que llega del servidor en tiempo real
-// y lo mete en la sesion local.
-static void apply_push(App *a, const char *json)
+static void authenticate(App *a, int registering)
 {
-    char chatname[MAX_NAME]   = "";
-    char author[MAX_NAME]     = "";
-    char content[MAX_MSG_LEN] = "";
-    char date[32]             = "";
+    char user[MAX_NAME] = "", pass[MAX_NAME] = "", buf[BUF_SIZE], message[256];
+    char *reply;
 
-    parse_str(json, "chatname",  chatname, sizeof(chatname));
-    parse_str(json, "author",    author,   sizeof(author));
-    parse_str(json, "contents",  content,  sizeof(content));
-    parse_str(json, "sent",      date,     sizeof(date));
-
-    if (!chatname[0]) return;
-
-    int idx = session_find_chat(&a->session, chatname);
-    if (idx < 0) {
-        idx = session_add_chat(&a->session, chatname);
-        a->tui.chat_selection = idx;
+    a->auth_mode = AUTH_MENU;
+    if (!a->connected && app_connect(a) < 0) {
+        tui_show_error(a->connect_error);
+        return;
+    }
+    if (!tui_credentials_form(registering ? "REGISTER" : "LOG IN", user, sizeof(user), pass, sizeof(pass)))
+        return;
+    if (!user[0] || !pass[0]) {
+        tui_show_error("Username and password are required");
+        return;
     }
 
-    if (author[0])
-        session_add_message(&a->session, idx, author, content, date);
+    if ((registering ? proto_create_user(buf, sizeof(buf), user, pass)
+                     : proto_login(buf, sizeof(buf), user, pass)) < 0) {
+        tui_show_error("Username or password too long");
+        return;
+    }
+    reply = request(a, buf, REPLY_TIMEOUT_MS);
+    if (!reply) {
+        tui_show_error("No reply from the server");
+        return;
+    }
+    if (!proto_reply_ok(reply)) {
+        proto_reply_message(reply, message, sizeof(message), "Authentication failed");
+        tui_show_error(message);
+        free(reply);
+        return;
+    }
+    free(reply);
 
+    /* In protocol v1 a successful registration is a single reply that already means logged in. */
+    snprintf(a->session.username, sizeof(a->session.username), "%s", user);
+    a->session.authenticated = 1;
+    load_history(a);
+    a->state = STATE_LIVE;
     a->needs_redraw = 1;
 }
-
-// -- AUTH --
 
 static void handle_auth_menu(App *a)
 {
-    tui_draw_auth_menu(a->connect_err);
-    int key = getch();
+    int key;
 
-    if (key == 'l')      a->auth_mode = AUTH_LOGIN;
-    else if (key == 'r') a->auth_mode = AUTH_REGISTER;
-    else if (key == 'q') a->state     = STATE_EXIT;
-
-    usleep(50000);
+    tui_draw_auth_menu(a->connected, a->connect_error);
+    key = getch(); /* blocks: the menu is drawn once, so it never flickers */
+    if (key == 'l')
+        a->auth_mode = AUTH_LOGIN;
+    else if (key == 'r')
+        a->auth_mode = AUTH_REGISTER;
+    else if (key == 'q')
+        a->state = STATE_EXIT;
 }
 
-static void handle_login(App *a)
-{
-    if (!a->connected) {
-        if (app_connect(a) < 0) {
-            tui_draw_error(a->connect_err);
-            a->auth_mode = AUTH_MENU;
-            return;
-        }
-    }
+/* ── chat screen ─────────────────────────────────────────────────────────────────────────── */
 
-    char user[MAX_NAME] = "";
-    char pass[MAX_NAME] = "";
-    tui_draw_login_form(user, pass);
-
-    if (!user[0] || !pass[0]) {
-        tui_draw_error("Usuario y contrasena obligatorios");
-        a->auth_mode = AUTH_MENU;
-        return;
-    }
-
-    char  buf[BUF_SIZE];
-    proto_login(buf, sizeof(buf), user, pass);
-    char *resp = send_recv(a, buf);
-
-    if (!resp) {
-        tui_draw_error("Sin respuesta del servidor");
-        a->auth_mode = AUTH_MENU;
-        return;
-    }
-
-    if (!resp_ok(resp)) {
-        char errmsg[256] = "Error de autenticacion";
-        parse_str(resp, "msg", errmsg, sizeof(errmsg));
-        tui_draw_error(errmsg);
-        free(resp);
-        a->auth_mode = AUTH_MENU;
-        return;
-    }
-
-    strncpy(a->session.username, user, MAX_NAME - 1);
-    a->session.authenticated = 1;
-
-    if (json_has_key(resp, "conversations"))
-        session_parse_convs(&a->session, resp);
-
-    free(resp);
-
-    // Pedir historial de conversaciones desde el principio.
-    // Timeout corto (2s) por si el servidor aun no lo implementa.
-    proto_load_delta(buf, sizeof(buf), user, "1970-01-01");
-    fprintf(stderr, "[SEND] %s\n", buf);
-    net_send(&a->net, buf);
-    char *delta = net_recv(&a->net, 10000);
-    fprintf(stderr, "[RECV delta] %s\n", delta ? delta : "NULL");
-    if (delta) {
-        if (json_has_key(delta, "conversations"))
-            session_parse_convs(&a->session, delta);
-        free(delta);
-    }
-
-    a->state        = STATE_LIVE;
-    a->needs_redraw = 1;
-    nodelay(stdscr, TRUE);
-    curs_set(0);
-}
-
-// El servidor manda 2 mensajes tras el registro:
-//   1. confirmacion del registro
-//   2. auto-login con conversaciones
-static void handle_register(App *a)
-{
-    if (!a->connected) {
-        if (app_connect(a) < 0) {
-            tui_draw_error(a->connect_err);
-            a->auth_mode = AUTH_MENU;
-            return;
-        }
-    }
-
-    char user[MAX_NAME] = "";
-    char pass[MAX_NAME] = "";
-    tui_draw_register_form(user, pass);
-
-    if (!user[0] || !pass[0]) {
-        tui_draw_error("Usuario y contrasena obligatorios");
-        a->auth_mode = AUTH_MENU;
-        return;
-    }
-
-    char buf[BUF_SIZE];
-    proto_create_user(buf, sizeof(buf), user, pass);
-    net_send(&a->net, buf);
-
-    char *resp1 = net_recv(&a->net, 5000);
-    fprintf(stderr, "[RECV register msg1] %s\n", resp1 ? resp1 : "NULL");
-    if (!resp1 || !resp_ok(resp1)) {
-        if (resp1) free(resp1);
-        tui_draw_error("Error en el registro");
-        a->auth_mode = AUTH_MENU;
-        return;
-    }
-    free(resp1);
-
-    char *resp2 = net_recv(&a->net, 5000);
-    fprintf(stderr, "[RECV register msg2] %s\n", resp2 ? resp2 : "NULL");
-
-    strncpy(a->session.username, user, MAX_NAME - 1);
-    a->session.authenticated = 1;
-
-    if (resp2) {
-        if (json_has_key(resp2, "conversations"))
-            session_parse_convs(&a->session, resp2);
-        free(resp2);
-    }
-
-    a->state        = STATE_LIVE;
-    a->needs_redraw = 1;
-    nodelay(stdscr, TRUE);
-    curs_set(0);
-}
-
-static void handle_auth(App *a)
-{
-    if (a->auth_mode == AUTH_MENU)         handle_auth_menu(a);
-    else if (a->auth_mode == AUTH_LOGIN)   handle_login(a);
-    else if (a->auth_mode == AUTH_REGISTER) handle_register(a);
-}
-
-// -- LIVE --
-
-// Navega por chats con flechas y drena mensajes push del servidor.
 static void handle_navigation(App *a)
 {
-    nodelay(stdscr, TRUE);
-    int key = getch();
-
     char *push;
+    int key;
+
+    timeout(POLL_INTERVAL_MS);
+    key = getch();
+
     while ((push = net_try_recv(&a->net)) != NULL) {
-        apply_push(a, push);
+        if (session_apply_push(&a->session, push))
+            a->needs_redraw = 1;
         free(push);
     }
-
-    if (key == -1) { usleep(50000); return; }
+    if (!net_alive(&a->net)) {
+        tui_set_status(&a->tui, "Connection to the server lost (q to quit)");
+        a->needs_redraw = 1;
+    }
+    if (key == ERR)
+        return;
 
     if (key == 'q') {
         a->state = STATE_EXIT;
-
-    } else if (key == KEY_UP) {
-        if (a->session.active_chat > 0) {
-            a->session.active_chat--;
-            a->tui.chat_selection = a->session.active_chat;
-            a->needs_redraw = 1;
-        }
-
-    } else if (key == KEY_DOWN) {
-        if (a->session.active_chat < a->session.nchats - 1) {
-            a->session.active_chat++;
-            a->tui.chat_selection = a->session.active_chat;
-            a->needs_redraw = 1;
-        }
-
-    } else if (key == '\n' || key == ' ') {
-        if (a->session.active_chat >= 0) {
-            a->live_mode    = LIVE_INPUT;
-            a->needs_redraw = 1;
-        }
-
-    } else if (key == 'n') {
-        a->live_mode    = LIVE_NEWCHAT;
+    } else if (key == KEY_UP && a->session.active_chat > 0) {
+        a->tui.chat_selection = --a->session.active_chat;
         a->needs_redraw = 1;
+    } else if (key == KEY_DOWN && a->session.active_chat < a->session.nchats - 1) {
+        a->tui.chat_selection = ++a->session.active_chat;
+        a->needs_redraw = 1;
+    } else if ((key == '\n' || key == ' ') && a->session.active_chat >= 0) {
+        a->live_mode = LIVE_INPUT;
+    } else if (key == 'n') {
+        a->live_mode = LIVE_NEWCHAT;
     }
 }
 
-// Lee un mensaje y lo manda. Si falla lo marca como [FALLIDO].
+static void trim(char *text)
+{
+    char *start = text;
+    size_t length;
+
+    while (*start == ' ')
+        start++;
+    memmove(text, start, strlen(start) + 1);
+    length = strlen(text);
+    while (length > 0 && text[length - 1] == ' ')
+        text[--length] = '\0';
+}
+
 static void handle_message_input(App *a)
 {
-    curs_set(1);
-    nodelay(stdscr, FALSE);
+    char text[BUF_SIZE / 2] = "", buf[BUF_SIZE], sent[DATE_LEN] = "";
+    const char *chat = a->session.chats[a->session.active_chat].name;
+    char *reply;
+    int submitted;
 
-    tui_set_status(&a->tui, "Escribiendo... (ENTER para enviar)");
+    timeout(-1);
+    tui_set_status(&a->tui, "Writing... (Enter sends, Esc cancels)");
     tui_draw(&a->tui, &a->session);
-    tui_get_input(&a->tui);
+    submitted = tui_read_message(&a->tui, text, sizeof(text));
+    trim(text);
 
-    char *msg = a->tui.input;
-    while (*msg == ' ') msg++;
-    int len = strlen(msg);
-    while (len > 0 && msg[len - 1] == ' ') msg[--len] = '\0';
-
-    if (len > 0 && a->session.active_chat >= 0) {
-        char *chat = a->session.chats[a->session.active_chat].name;
-        char  buf[BUF_SIZE];
-        proto_send_msg(buf, sizeof(buf), chat, msg, a->session.username);
-        char *resp = send_recv(a, buf);
-
-        if (resp_ok(resp)) {
-            session_add_message(&a->session, a->session.active_chat,
-                                a->session.username, msg, "");
-            tui_set_status(&a->tui, "Mensaje enviado");
-        } else {
-            char failed[MAX_MSG_LEN];
-            snprintf(failed, sizeof(failed), "[FALLIDO] %s", msg);
-            session_add_message(&a->session, a->session.active_chat,
-                                a->session.username, failed, "");
-            tui_set_status(&a->tui, "Error enviando mensaje");
-        }
-
-        if (resp) free(resp);
-    }
-
-    a->live_mode    = LIVE_NAVIGATION;
+    a->live_mode = LIVE_NAVIGATION;
     a->needs_redraw = 1;
-    curs_set(0);
-    nodelay(stdscr, TRUE);
+    tui_set_status(&a->tui, "");
+    if (!submitted || !text[0])
+        return;
+
+    if (proto_send_msg(buf, sizeof(buf), chat, text) < 0) {
+        tui_set_status(&a->tui, "Message too long");
+        return;
+    }
+    reply = request(a, buf, REPLY_TIMEOUT_MS);
+    if (proto_reply_ok(reply)) {
+        json_object_get_string(reply, "sent", sent, sizeof(sent));
+        session_add_message(&a->session, a->session.active_chat, a->session.username, text, sent, 0);
+        tui_set_status(&a->tui, "Sent");
+    } else {
+        session_add_message(&a->session, a->session.active_chat, a->session.username, text, "", 1);
+        tui_set_status(&a->tui, "Could not send the message");
+    }
+    free(reply);
 }
 
-// Crea un chat nuevo. El creador se añade automaticamente.
 static void handle_newchat(App *a)
 {
-    char name[MAX_NAME]  = "";
-    char parts[BUF_SIZE] = "";
-    tui_draw_newchat_form(name, parts);
+    char name[MAX_NAME] = "", list[BUF_SIZE / 2] = "", buf[BUF_SIZE];
+    const char *participants[MAX_CHATS + 1];
+    char *reply, *saveptr = NULL, *token;
+    int count = 0;
 
-    if (!name[0] || !parts[0]) {
-        a->live_mode    = LIVE_NAVIGATION;
-        a->needs_redraw = 1;
+    timeout(-1);
+    a->live_mode = LIVE_NAVIGATION;
+    a->needs_redraw = 1;
+    tui_set_status(&a->tui, "");
+    if (!tui_newchat_form(name, sizeof(name), list, sizeof(list)))
+        return;
+    trim(name);
+    if (!name[0] || !list[0]) {
+        tui_set_status(&a->tui, "A name and at least one participant are required");
         return;
     }
 
-    const char *participants[MAX_CHATS + 1];
-    char        parts_copy[BUF_SIZE];
-    strncpy(parts_copy, parts, sizeof(parts_copy) - 1);
-
-    int   nparts = 0;
-    char *tok    = strtok(parts_copy, ",");
-    participants[nparts++] = a->session.username;
-    while (tok && nparts < MAX_CHATS) {
-        while (*tok == ' ') tok++;
-        if (strcmp(tok, a->session.username) != 0)
-            participants[nparts++] = tok;
-        tok = strtok(NULL, ",");
+    participants[count++] = a->session.username; /* the creator is always a member */
+    for (token = strtok_r(list, ",", &saveptr); token && count < MAX_CHATS; token = strtok_r(NULL, ",", &saveptr)) {
+        trim(token);
+        if (token[0] && strcmp(token, a->session.username) != 0)
+            participants[count++] = token;
     }
 
-    char buf[BUF_SIZE];
-    proto_create_chat(buf, sizeof(buf), name, participants, nparts);
-    char *resp = send_recv(a, buf);
-
-    if (resp_ok(resp)) {
-        int idx = session_find_chat(&a->session, name);
-        if (idx < 0)
-            idx = session_add_chat(&a->session, name);
-        a->session.active_chat = idx;
-        a->tui.chat_selection  = idx;
-        tui_set_status(&a->tui, "Chat creado");
+    if (proto_create_chat(buf, sizeof(buf), name, participants, count) < 0) {
+        tui_set_status(&a->tui, "Chat name or participant list too long");
+        return;
+    }
+    reply = request(a, buf, REPLY_TIMEOUT_MS);
+    if (proto_reply_ok(reply)) {
+        a->session.active_chat = session_add_chat(&a->session, name);
+        a->tui.chat_selection = a->session.active_chat;
+        tui_set_status(&a->tui, "Chat created");
     } else {
-        tui_set_status(&a->tui, "Error creando chat");
-    }
+        char message[256];
 
-    if (resp) free(resp);
-    a->live_mode    = LIVE_NAVIGATION;
-    a->needs_redraw = 1;
-    nodelay(stdscr, TRUE);
+        proto_reply_message(reply, message, sizeof(message), "Could not create the chat");
+        tui_set_status(&a->tui, message);
+    }
+    free(reply);
 }
 
 static void handle_live(App *a)
 {
     if (a->needs_redraw) {
-        char status[256];
-        snprintf(status, sizeof(status),
-                 "Conectado como %s | UP/DOWN: navegar | ENTER: escribir | n: nuevo chat | q: salir",
-                 a->session.username);
-        tui_set_status(&a->tui, status);
+        if (!a->tui.status[0]) {
+            char status[256];
+
+            snprintf(status, sizeof(status), "%s | Up/Down: chats | Enter: write | n: new chat | q: quit",
+                     a->session.username);
+            tui_set_status(&a->tui, status);
+        }
         tui_draw(&a->tui, &a->session);
         a->needs_redraw = 0;
     }
 
-    if (a->live_mode == LIVE_NAVIGATION)    handle_navigation(a);
-    else if (a->live_mode == LIVE_INPUT)    handle_message_input(a);
-    else if (a->live_mode == LIVE_NEWCHAT)  handle_newchat(a);
+    if (a->live_mode == LIVE_NAVIGATION)
+        handle_navigation(a);
+    else if (a->live_mode == LIVE_INPUT)
+        handle_message_input(a);
+    else
+        handle_newchat(a);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     App *a = calloc(1, sizeof(App));
+    char error[256], buf[BUF_SIZE];
+
     if (!a) {
-        fprintf(stderr, "Error de memoria\n");
+        fprintf(stderr, "out of memory\n");
         return 1;
     }
-
-    a->state        = STATE_AUTH;
-    a->auth_mode    = AUTH_MENU;
-    a->live_mode    = LIVE_NAVIGATION;
-    a->needs_redraw = 1;
-
-    if (load_config(a->ip, sizeof(a->ip), &a->port) < 0) {
+    if (config_resolve(&a->address, argc, argv, environment, error, sizeof(error)) < 0) {
+        fprintf(stderr, "%s\n", error);
         free(a);
-        return 1;
+        return 2;
     }
 
     session_init(&a->session);
+    a->state = STATE_AUTH;
+    a->auth_mode = AUTH_MENU;
+    a->live_mode = LIVE_NAVIGATION;
+    a->needs_redraw = 1;
+
     tui_init(&a->tui);
     app_connect(a);
 
     while (a->state != STATE_EXIT) {
-        if (a->state == STATE_AUTH)         handle_auth(a);
-        else if (a->state == STATE_LIVE)    handle_live(a);
+        if (a->state == STATE_AUTH) {
+            if (a->auth_mode == AUTH_MENU)
+                handle_auth_menu(a);
+            else
+                authenticate(a, a->auth_mode == AUTH_REGISTER);
+        } else {
+            handle_live(a);
+        }
     }
 
-    if (a->session.authenticated && a->connected) {
-        char buf[BUF_SIZE];
-        proto_logout(buf, sizeof(buf));
+    if (a->session.authenticated && a->connected && proto_logout(buf, sizeof(buf)) == 0)
         net_send(&a->net, buf);
-    }
-
-    net_close(&a->net);
+    if (a->connected)
+        net_close(&a->net);
     tui_cleanup();
     free(a);
     return 0;

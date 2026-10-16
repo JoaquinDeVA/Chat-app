@@ -60,10 +60,16 @@ class MessagingApp:
         self.net.close()
 
     def _try_connect(self) -> bool:
+        """Connects and opens the conversation with the protocol version."""
         try:
             self.net.connect()
         except OSError as error:
             self.connected, self.connect_error = False, str(error)
+            return False
+        reply = self.api.hello()
+        if not reply.ok:
+            self.net.close()
+            self.connected, self.connect_error = False, reply.message
             return False
         self.connected, self.connect_error = True, ""
         return True

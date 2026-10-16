@@ -22,6 +22,11 @@ pub const EOT: u8 = 0x04;
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ClientRequest {
+    /// Opens the conversation: the protocol version the client speaks (see [`crate::versions`]).
+    Hello {
+        #[serde(default)]
+        version: u32,
+    },
     /// Register a user (and log it in).
     CreateUser {
         #[serde(default)]
@@ -97,6 +102,21 @@ impl StatusReply {
         self.sent = Some(sent.to_owned());
         self
     }
+}
+
+/// Reply to [`ClientRequest::Hello`].
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HelloReply {
+    /// `1` if the version is supported.
+    pub processed: u8,
+    /// Human-readable detail.
+    pub msg: String,
+    /// The version that will be used for the connection (the one requested).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+    /// The versions this server speaks, sent when the requested one is not supported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported: Option<Vec<u32>>,
 }
 
 /// A chat message, as stored by the backend and pushed to clients.
@@ -287,6 +307,18 @@ mod tests {
         assert_eq!(
             parse(r#"{"action":"logout"}"#).unwrap(),
             ClientRequest::Logout
+        );
+    }
+
+    #[test]
+    fn hello_carries_the_version() {
+        assert_eq!(
+            parse(r#"{"action":"hello","version":2}"#).unwrap(),
+            ClientRequest::Hello { version: 2 }
+        );
+        assert_eq!(
+            parse(r#"{"action":"hello"}"#).unwrap(),
+            ClientRequest::Hello { version: 0 }
         );
     }
 

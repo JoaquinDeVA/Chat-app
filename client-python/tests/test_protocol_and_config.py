@@ -52,3 +52,9 @@ class TestConfig:
     def test_invalid_ports_are_rejected(self, port):
         with pytest.raises(SystemExit):
             resolve_address(["--port", port], {})
+
+
+def test_hello_announces_the_protocol_version():
+    assert json.loads(protocol.build_hello()) == {"action": "hello", "version": 2}
+    assert json.loads(protocol.build_hello(1))["version"] == 1
+    assert protocol.PROTOCOL_VERSION == 2

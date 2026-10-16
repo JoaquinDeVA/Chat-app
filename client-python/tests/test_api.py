@@ -47,3 +47,15 @@ def test_logout_is_sent_only_while_connected_and_never_raises(transport):
     transport.running = False
     api.logout()
     assert len(transport.sent) == 1
+
+
+def test_hello_is_the_version_announcement(transport):
+    transport.script({"processed": 1, "msg": "ok", "version": 2})
+    reply = APIClient(transport).hello()
+    assert reply.ok and json.loads(transport.sent[0]) == {"action": "hello", "version": 2}
+
+
+def test_a_refused_version_explains_which_ones_the_server_speaks(transport):
+    transport.script({"processed": 0, "msg": "Unsupported protocol version", "supported": [1]})
+    reply = APIClient(transport).hello()
+    assert not reply.ok and "[1]" in reply.message

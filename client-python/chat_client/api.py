@@ -63,6 +63,13 @@ class APIClient:
             return Reply(False, "No valid reply from the server")
         return Reply(_is_ok(reply), str(reply.get("msg", "")), reply)
 
+    def hello(self) -> Reply:
+        """Opens the conversation by announcing the protocol version. Must be the first message."""
+        reply = self._request(protocol.build_hello())
+        if not reply.ok and "supported" in reply.data:
+            reply.message = f"{reply.message} (the server speaks versions {reply.data['supported']})"
+        return reply
+
     def login(self, username: str, password: str) -> Reply:
         """Logs in as an existing user."""
         return self._request(protocol.build_login(username, password))

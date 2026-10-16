@@ -72,6 +72,22 @@ def feed_lines(monkeypatch, *values):
     monkeypatch.setattr(app_module, "read_line", lambda *a, **k: queue.pop(0))
 
 
+class TestConnecting:
+    def test_the_conversation_opens_with_hello_and_a_refusal_means_no_connection(self, make_app, monkeypatch):
+        application, _ = make_app(connected=False)
+        monkeypatch.setattr(application.net, "connect", lambda: None)
+        monkeypatch.setattr(application.net, "close", lambda: None)
+        monkeypatch.setattr(application.api, "hello", lambda: Reply(True, "ok"))
+        assert application._try_connect() and application.connected
+        monkeypatch.setattr(application.api, "hello", lambda: Reply(False, "Unsupported protocol version"))
+        assert not application._try_connect()
+        assert application.connect_error == "Unsupported protocol version"
+
+    def test_a_server_that_cannot_be_reached_is_reported(self, make_app):
+        application, _ = make_app(connected=False)
+        assert not application._try_connect() and application.connect_error
+
+
 class TestAuthMenu:
     @pytest.mark.parametrize(
         ("key", "mode", "state"),

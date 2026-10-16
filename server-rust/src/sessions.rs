@@ -9,9 +9,16 @@ use std::io::Write;
 
 use crate::backend::{Backend, BackendError};
 use crate::protocol::{
-    ChatMessage, ClientRequest, ConversationsReply, NewChatNotice, StatusReply, frame,
+    ChatMessage, ClientRequest, ConversationsReply, HelloReply, NewChatNotice, StatusReply, frame,
     take_messages,
 };
+use crate::versions::{self, Protocol, SUPPORTED_VERSIONS, is_valid_name};
+
+/// Longest username (the backend column holds 50 characters).
+const MAX_USERNAME: usize = 50;
+/// Longest chat name (the backend column holds 100 characters).
+const MAX_CHAT_NAME: usize = 100;
+const INVALID_NAME: &str = "Names may only contain letters, digits, '_', '-' and '.'";
 
 /// Identifier of a connection, chosen by the caller of [`Sessions::connect`].
 pub type ClientId = u64;
@@ -23,6 +30,8 @@ const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
 struct Session<W> {
     writer: W,
+    /// `None` until the client says hello; selects what differs between protocol versions.
+    protocol: Option<Box<dyn Protocol>>,
     /// `None` until the client logs in.
     username: Option<String>,
     /// Bytes received that do not form a complete message yet.
@@ -59,6 +68,7 @@ impl<B: Backend, W: Write> Sessions<B, W> {
             id,
             Session {
                 writer,
+                protocol: None,
                 username: None,
                 buffer: Vec::new(),
             },
@@ -88,6 +98,15 @@ impl<B: Backend, W: Write> Sessions<B, W> {
     /// True if `id` is a connected client.
     pub fn contains(&self, id: ClientId) -> bool {
         self.clients.contains_key(&id)
+    }
+
+    /// Protocol version a connection announced with `hello`.
+    pub fn protocol_version(&self, id: ClientId) -> Option<u32> {
+        self.clients
+            .get(&id)?
+            .protocol
+            .as_ref()
+            .map(|p| p.version())
     }
 
     /// Username a connection is logged in as.
@@ -143,15 +162,22 @@ impl<B: Backend, W: Write> Sessions<B, W> {
     }
 
     fn handle(&mut self, id: ClientId, request: ClientRequest) -> bool {
-        let Some(username) = self
-            .clients
-            .get(&id)
-            .map(|session| session.username.clone())
-        else {
+        let Some(session) = self.clients.get(&id) else {
             return false;
         };
+        if let ClientRequest::Hello { version } = request {
+            return self.hello(id, version);
+        }
+        if session.protocol.is_none() {
+            return self.reply(
+                id,
+                &StatusReply::error("Say hello with your protocol version first"),
+            );
+        }
+        let username = session.username.clone();
 
         match (request, username) {
+            (ClientRequest::Hello { .. }, _) => true, // handled above
             (ClientRequest::CreateUser { username, password }, None) => {
                 self.create_user(id, &username, &password)
             }
@@ -184,7 +210,45 @@ impl<B: Backend, W: Write> Sessions<B, W> {
 
     // ── handlers ─────────────────────────────────────────────────────────────────────────────
 
-    /// Registers the user, then logs it in, answering twice (clients rely on both replies).
+    /// Selects the protocol version of the connection. An unsupported version closes it.
+    fn hello(&mut self, id: ClientId, version: u32) -> bool {
+        if self.protocol_version(id).is_some() {
+            return self.reply(id, &StatusReply::error("Already said hello"));
+        }
+        match versions::for_version(version) {
+            Some(protocol) => {
+                if let Some(session) = self.clients.get_mut(&id) {
+                    session.protocol = Some(protocol);
+                }
+                log::info!("client {id} speaks protocol v{version}");
+                self.reply(
+                    id,
+                    &HelloReply {
+                        processed: 1,
+                        msg: "ok".to_owned(),
+                        version: Some(version),
+                        supported: None,
+                    },
+                )
+            }
+            None => {
+                self.reply(
+                    id,
+                    &HelloReply {
+                        processed: 0,
+                        msg: "Unsupported protocol version".to_owned(),
+                        version: None,
+                        supported: Some(SUPPORTED_VERSIONS.to_vec()),
+                    },
+                );
+                false
+            }
+        }
+    }
+
+    /// Registers the user and logs it in. Version 1 clients get one reply that already means
+    /// "registered and logged in"; later versions get two: the registration result, then the
+    /// result of the automatic login.
     fn create_user(&mut self, id: ClientId, username: &str, password: &str) -> bool {
         if username.trim().is_empty() || password.is_empty() {
             return self.reply(
@@ -192,12 +256,24 @@ impl<B: Backend, W: Write> Sessions<B, W> {
                 &StatusReply::error("Username and password are required"),
             );
         }
+        if !is_valid_name(username, MAX_USERNAME) {
+            return self.reply(id, &StatusReply::error(INVALID_NAME));
+        }
         match self.backend.add_user(username, password) {
             Ok(true) => {
-                if !self.reply(id, &StatusReply::ok("User added")) {
-                    return false;
+                let two_replies = self
+                    .clients
+                    .get(&id)
+                    .and_then(|session| session.protocol.as_ref())
+                    .is_some_and(|protocol| protocol.registration_sends_login_reply());
+                if two_replies {
+                    if !self.reply(id, &StatusReply::ok("User added")) {
+                        return false;
+                    }
+                    self.login(id, username, password)
+                } else {
+                    self.open_session(id, username, password, "User added and logged in")
                 }
-                self.login(id, username, password)
             }
             Ok(false) => self.reply(id, &StatusReply::error("Could not add user")),
             Err(error) => self.backend_failed(id, &error),
@@ -205,13 +281,24 @@ impl<B: Backend, W: Write> Sessions<B, W> {
     }
 
     fn login(&mut self, id: ClientId, username: &str, password: &str) -> bool {
+        self.open_session(id, username, password, "ok")
+    }
+
+    /// Checks the password and, if it is right, logs the connection in.
+    fn open_session(
+        &mut self,
+        id: ClientId,
+        username: &str,
+        password: &str,
+        success: &str,
+    ) -> bool {
         match self.backend.authenticate(username, password) {
             Ok(true) => {
                 if let Some(session) = self.clients.get_mut(&id) {
                     session.username = Some(username.to_owned());
                 }
                 log::info!("{username} logged in (client {id})");
-                self.reply(id, &StatusReply::ok("ok"))
+                self.reply(id, &StatusReply::ok(success))
             }
             Ok(false) => self.reply(id, &StatusReply::error("Authentication failed")),
             Err(error) => self.backend_failed(id, &error),
@@ -220,14 +307,23 @@ impl<B: Backend, W: Write> Sessions<B, W> {
 
     fn load_delta(&mut self, id: ClientId, user: &str, since: &str) -> bool {
         match self.backend.message_delta(user, since) {
-            Ok(conversations) => self.reply(
-                id,
-                &ConversationsReply {
-                    code: 1,
-                    msg: String::new(),
-                    conversations,
-                },
-            ),
+            Ok(mut conversations) => {
+                if let Some(protocol) = self.clients.get(&id).and_then(|s| s.protocol.as_ref()) {
+                    for messages in conversations.values_mut() {
+                        for message in messages.iter_mut() {
+                            *message = protocol.present(message);
+                        }
+                    }
+                }
+                self.reply(
+                    id,
+                    &ConversationsReply {
+                        code: 1,
+                        msg: String::new(),
+                        conversations,
+                    },
+                )
+            }
             Err(error) => self.backend_failed(id, &error),
         }
     }
@@ -244,6 +340,13 @@ impl<B: Backend, W: Write> Sessions<B, W> {
             if !participant.trim().is_empty() && !members.contains(&participant) {
                 members.push(participant);
             }
+        }
+        if !is_valid_name(chat, MAX_CHAT_NAME)
+            || members
+                .iter()
+                .any(|name| !is_valid_name(name, MAX_USERNAME))
+        {
+            return self.reply(id, &StatusReply::error(INVALID_NAME));
         }
 
         match self.backend.create_chat(chat, &members) {
@@ -263,8 +366,16 @@ impl<B: Backend, W: Write> Sessions<B, W> {
     }
 
     fn send_message(&mut self, id: ClientId, user: &str, chat: &str, text: &str) -> bool {
+        let checked = match self.clients.get(&id).and_then(|s| s.protocol.as_ref()) {
+            Some(protocol) => protocol.check_message(text),
+            None => return false,
+        };
+        let text = match checked {
+            Ok(text) => text,
+            Err(reason) => return self.reply(id, &StatusReply::error(reason)),
+        };
         let sent = (self.clock)();
-        match self.backend.send_message(user, chat, text, &sent) {
+        match self.backend.send_message(user, chat, &text, &sent) {
             Ok(true) => {
                 let message = ChatMessage {
                     author: user.to_owned(),
@@ -273,7 +384,7 @@ impl<B: Backend, W: Write> Sessions<B, W> {
                     chatname: chat.to_owned(),
                 };
                 match self.backend.chat_members(chat) {
-                    Ok(members) => self.push_to_users(&members, Some(id), &frame(&message)),
+                    Ok(members) => self.push_message(&members, Some(id), &message),
                     Err(error) => {
                         log::warn!("message stored but members of '{chat}' unknown: {error}")
                     }
@@ -305,6 +416,30 @@ impl<B: Backend, W: Write> Sessions<B, W> {
                 .and_then(|()| session.writer.flush())
                 .is_ok(),
             None => false,
+        }
+    }
+
+    /// Pushes a message to every connection logged in as one of `users`, except `skip`, each
+    /// receiving it as its protocol version presents it.
+    fn push_message(&mut self, users: &[String], skip: Option<ClientId>, message: &ChatMessage) {
+        let mut deliveries: Vec<(ClientId, Vec<u8>)> = Vec::new();
+        for (id, session) in &self.clients {
+            let member = session
+                .username
+                .as_ref()
+                .is_some_and(|name| users.contains(name));
+            if Some(*id) != skip && member {
+                let shown = match session.protocol.as_ref() {
+                    Some(protocol) => protocol.present(message),
+                    None => message.clone(),
+                };
+                deliveries.push((*id, frame(&shown)));
+            }
+        }
+        for (id, bytes) in deliveries {
+            if !self.write_to(id, &bytes) {
+                self.disconnect(id);
+            }
         }
     }
 
@@ -521,11 +656,30 @@ mod tests {
             Rig { server, world }
         }
 
-        /// Connects a client and returns the wire its replies are written to.
-        fn client(&mut self, id: ClientId) -> Wire {
+        /// Connects a client without saying hello.
+        fn raw_client(&mut self, id: ClientId) -> Wire {
             let wire = Wire::default();
             self.server.connect(id, wire.clone());
             wire
+        }
+
+        /// Connects a client that speaks protocol `version` and returns its wire.
+        fn client_v(&mut self, id: ClientId, version: u32) -> Wire {
+            let wire = self.raw_client(id);
+            self.send(id, json!({"action":"hello","version":version}));
+            assert_eq!(status(&wire.messages()[0]).0, 1, "hello accepted");
+            wire.clear();
+            wire
+        }
+
+        /// A version 2 (full) client.
+        fn client(&mut self, id: ClientId) -> Wire {
+            self.client_v(id, 2)
+        }
+
+        /// A version 1 (simple) client.
+        fn client_v1(&mut self, id: ClientId) -> Wire {
+            self.client_v(id, 1)
         }
 
         fn send(&mut self, id: ClientId, request: Value) -> bool {
@@ -534,9 +688,20 @@ mod tests {
             self.server.receive(id, &bytes)
         }
 
-        /// Registers and logs in `name` on a new connection.
+        /// Registers and logs in `name` on a new version 2 connection.
         fn user(&mut self, id: ClientId, name: &str) -> Wire {
             let wire = self.client(id);
+            self.send(
+                id,
+                json!({"action":"create_user","username":name,"password":"pw"}),
+            );
+            wire.clear();
+            wire
+        }
+
+        /// Registers and logs in `name` on a new version 1 connection.
+        fn user_v1(&mut self, id: ClientId, name: &str) -> Wire {
+            let wire = self.client_v1(id);
             self.send(
                 id,
                 json!({"action":"create_user","username":name,"password":"pw"}),
@@ -921,5 +1086,255 @@ mod tests {
         let mut rig = Rig::new();
         rig.server.shutdown_backend();
         assert!(rig.world.0.borrow().shut_down);
+    }
+
+    // ── protocol versions ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn nothing_works_before_hello() {
+        let mut rig = Rig::new();
+        let wire = rig.raw_client(1);
+        for request in [
+            json!({"action":"login","username":"ana","password":"pw"}),
+            json!({"action":"create_user","username":"ana","password":"pw"}),
+            json!({"action":"send_msg","chat":"c","msg":"hi"}),
+        ] {
+            assert!(rig.send(1, request), "the connection stays open");
+        }
+        assert!(
+            wire.messages()
+                .iter()
+                .all(|r| status(r) == (0, "Say hello with your protocol version first"))
+        );
+        assert!(rig.world.0.borrow().calls.is_empty());
+        assert_eq!(rig.server.protocol_version(1), None);
+    }
+
+    #[test]
+    fn hello_selects_the_version_and_answers_with_it() {
+        let mut rig = Rig::new();
+        let wire = rig.raw_client(1);
+        rig.send(1, json!({"action":"hello","version":1}));
+        assert_eq!(
+            wire.messages()[0],
+            json!({"processed":1,"msg":"ok","version":1})
+        );
+        assert_eq!(rig.server.protocol_version(1), Some(1));
+        let wire = rig.raw_client(2);
+        rig.send(2, json!({"action":"hello","version":2}));
+        assert_eq!(wire.messages()[0]["version"], 2);
+        assert_eq!(rig.server.protocol_version(2), Some(2));
+    }
+
+    #[test]
+    fn an_unsupported_version_is_refused_with_the_supported_ones_and_the_connection_closes() {
+        let mut rig = Rig::new();
+        for version in [0, 3, 99] {
+            let wire = rig.raw_client(1);
+            assert!(!rig.send(1, json!({"action":"hello","version":version})));
+            let reply = &wire.messages()[0];
+            assert_eq!(status(reply), (0, "Unsupported protocol version"));
+            assert_eq!(reply["supported"], json!([1, 2]));
+        }
+        let wire = rig.raw_client(2);
+        assert!(
+            !rig.send(2, json!({"action":"hello"})),
+            "a missing version is version 0"
+        );
+        assert_eq!(wire.messages()[0]["supported"], json!([1, 2]));
+    }
+
+    #[test]
+    fn hello_cannot_be_repeated() {
+        let mut rig = Rig::new();
+        let wire = rig.client_v1(1);
+        rig.send(1, json!({"action":"hello","version":2}));
+        assert_eq!(status(&wire.messages()[0]), (0, "Already said hello"));
+        assert_eq!(
+            rig.server.protocol_version(1),
+            Some(1),
+            "the version does not change"
+        );
+    }
+
+    #[test]
+    fn version_1_registration_is_a_single_reply_that_already_logs_in() {
+        let mut rig = Rig::new();
+        let wire = rig.client_v1(1);
+        rig.send(
+            1,
+            json!({"action":"create_user","username":"ana","password":"pw"}),
+        );
+        let replies = wire.messages();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(status(&replies[0]), (1, "User added and logged in"));
+        assert_eq!(rig.server.username(1), Some("ana"));
+    }
+
+    #[test]
+    fn version_1_failed_registration_is_still_a_single_reply() {
+        let mut rig = Rig::new();
+        rig.user(1, "ana");
+        let wire = rig.client_v1(2);
+        rig.send(
+            2,
+            json!({"action":"create_user","username":"ana","password":"x"}),
+        );
+        assert_eq!(wire.messages().len(), 1);
+        assert_eq!(rig.server.username(2), None);
+    }
+
+    #[test]
+    fn names_must_be_plain_ascii_identifiers() {
+        let mut rig = Rig::new();
+        let wire = rig.client(1);
+        for bad in ["équipe", "with space", "a/b", "", "x".repeat(51).as_str()] {
+            rig.send(
+                1,
+                json!({"action":"create_user","username":bad,"password":"pw"}),
+            );
+        }
+        assert!(wire.messages().iter().all(|r| status(r).0 == 0));
+        assert!(rig.world.0.borrow().users.is_empty());
+
+        rig.user(2, "ana");
+        rig.user(3, "ben");
+        let ana = rig.client(4);
+        rig.send(
+            4,
+            json!({"action":"login","username":"ana","password":"pw"}),
+        );
+        ana.clear();
+        for chat in ["équipe", "with space", ""] {
+            rig.send(
+                4,
+                json!({"action":"create_chat","chat_name":chat,"participants":["ben"]}),
+            );
+        }
+        rig.send(
+            4,
+            json!({"action":"create_chat","chat_name":"team","participants":["bén"]}),
+        );
+        assert!(
+            ana.messages()
+                .iter()
+                .all(|r| status(r) == (0, INVALID_NAME)),
+            "{:?}",
+            ana.messages()
+        );
+        assert!(rig.world.0.borrow().chats.is_empty());
+    }
+
+    /// Two users in a chat: `ana` on version 2 and `bob` on version 1.
+    fn mixed_chat() -> (Rig, Wire, Wire) {
+        let mut rig = Rig::new();
+        let ana = rig.user(1, "ana");
+        let bob = rig.user_v1(2, "bob");
+        rig.send(
+            1,
+            json!({"action":"create_chat","chat_name":"team","participants":["bob"]}),
+        );
+        ana.clear();
+        bob.clear();
+        (rig, ana, bob)
+    }
+
+    #[test]
+    fn version_1_refuses_text_it_cannot_handle_and_stores_nothing() {
+        let (mut rig, ana, bob) = mixed_chat();
+        for text in ["hola ñ", "smile 😀", "two\nlines", "[[img]]|.png|AAAA", ""] {
+            rig.send(2, json!({"action":"send_msg","chat":"team","msg":text}));
+        }
+        rig.send(
+            2,
+            json!({"action":"send_msg","chat":"team","msg":"a".repeat(1001)}),
+        );
+        assert!(
+            bob.messages().iter().all(|r| status(r).0 == 0),
+            "{:?}",
+            bob.messages()
+        );
+        assert_eq!(bob.messages().len(), 6);
+        assert!(rig.world.0.borrow().messages.is_empty());
+        assert!(ana.messages().is_empty(), "nothing was pushed");
+
+        rig.send(
+            2,
+            json!({"action":"send_msg","chat":"team","msg":"plain text 123!"}),
+        );
+        assert_eq!(rig.world.0.borrow().messages.len(), 1);
+    }
+
+    #[test]
+    fn version_2_text_reaches_a_version_1_client_in_a_degraded_form() {
+        let (mut rig, _ana, bob) = mixed_chat();
+
+        rig.send(
+            1,
+            json!({"action":"send_msg","chat":"team","msg":"hola ñ 😀"}),
+        );
+        rig.send(
+            1,
+            json!({"action":"send_msg","chat":"team","msg":"[[img]]|.png|AAAA"}),
+        );
+
+        assert_eq!(bob.messages()[0]["contents"], "hola ? ?");
+        assert_eq!(bob.messages()[1]["contents"], "[image]");
+        assert_eq!(
+            rig.world.0.borrow().messages[0].contents,
+            "hola ñ 😀",
+            "storage keeps the original"
+        );
+    }
+
+    #[test]
+    fn the_same_message_is_presented_per_recipient_version() {
+        let mut rig = Rig::new();
+        let ana = rig.user(1, "ana");
+        let bob_simple = rig.user_v1(2, "bob");
+        let cat_full = rig.user(3, "cat");
+        rig.send(
+            1,
+            json!({"action":"create_chat","chat_name":"team","participants":["bob","cat"]}),
+        );
+        for wire in [&ana, &bob_simple, &cat_full] {
+            wire.clear();
+        }
+
+        rig.send(
+            1,
+            json!({"action":"send_msg","chat":"team","msg":"café ☕"}),
+        );
+
+        assert_eq!(bob_simple.messages()[0]["contents"], "caf? ?");
+        assert_eq!(cat_full.messages()[0]["contents"], "café ☕");
+    }
+
+    #[test]
+    fn the_history_is_presented_per_version_too() {
+        let (mut rig, ana, bob) = mixed_chat();
+        rig.send(1, json!({"action":"send_msg","chat":"team","msg":"ñandú"}));
+        rig.send(
+            1,
+            json!({"action":"send_msg","chat":"team","msg":"[[img]]|.png|AAAA"}),
+        );
+        ana.clear();
+        bob.clear();
+
+        rig.send(
+            1,
+            json!({"action":"load_message_delta","since":"2000-01-01 00:00:00"}),
+        );
+        rig.send(
+            2,
+            json!({"action":"load_message_delta","since":"2000-01-01 00:00:00"}),
+        );
+
+        let full = &ana.messages()[0]["conversations"]["team"];
+        let simple = &bob.messages()[0]["conversations"]["team"];
+        assert_eq!(full[0]["contents"], "ñandú");
+        assert_eq!(full[1]["contents"], "[[img]]|.png|AAAA");
+        assert_eq!(simple[0]["contents"], "?and?");
+        assert_eq!(simple[1]["contents"], "[image]");
     }
 }

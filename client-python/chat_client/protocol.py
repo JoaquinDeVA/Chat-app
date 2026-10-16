@@ -9,6 +9,15 @@ from typing import Any
 
 EOT = b"\x04"
 
+#: Version of the protocol this client speaks. Version 2 is the full protocol: Unicode text and
+#: images (see ``docs/PROTOCOL.md``); the simple clients (version 1) are text-only ASCII.
+PROTOCOL_VERSION = 2
+
+
+def build_hello(version: int = PROTOCOL_VERSION) -> str:
+    """Opening message: tells the server which protocol version this client speaks."""
+    return json.dumps({"action": "hello", "version": version})
+
 
 def build_login(username: str, password: str) -> str:
     """Request to log in as an existing user."""

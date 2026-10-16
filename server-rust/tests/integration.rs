@@ -131,7 +131,21 @@ fn start() -> RunningServer {
 }
 
 impl RunningServer {
+    /// A client that speaks protocol `version`, already introduced with `hello`.
+    fn client_v(&self, version: u32) -> Client {
+        let mut client = self.raw_client();
+        client.send(json!({"action":"hello","version":version}));
+        assert_eq!(client.recv().unwrap()["version"], version);
+        client
+    }
+
+    /// A full (version 2) client.
     fn client(&self) -> Client {
+        self.client_v(2)
+    }
+
+    /// A connection that has not said hello yet.
+    fn raw_client(&self) -> Client {
         let stream = TcpStream::connect(&self.address).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -197,21 +211,21 @@ fn a_conversation_between_two_clients() {
     ana.register("ana");
     ben.register("ben");
 
-    ana.send(json!({"action":"create_chat","chat_name":"équipe","participants":["ben"]}));
+    ana.send(json!({"action":"create_chat","chat_name":"equipe","participants":["ben"]}));
     assert_eq!(ana.recv().unwrap()["msg"], "Chat created");
-    assert_eq!(ben.recv().unwrap(), json!({"chatname":"équipe"}));
+    assert_eq!(ben.recv().unwrap(), json!({"chatname":"equipe"}));
 
-    ana.send(json!({"action":"send_msg","username":"ana","chat":"équipe","msg":"hola ñ 😀"}));
+    ana.send(json!({"action":"send_msg","username":"ana","chat":"equipe","msg":"hola ñ 😀"}));
     assert_eq!(ana.recv().unwrap()["msg"], "Message sent");
     let pushed = ben.recv().unwrap();
     assert_eq!(pushed["author"], "ana");
     assert_eq!(pushed["contents"], "hola ñ 😀");
-    assert_eq!(pushed["chatname"], "équipe");
+    assert_eq!(pushed["chatname"], "equipe");
 
     ben.send(json!({"action":"load_message_delta","username":"ben","since":"2000-01-01 00:00:00"}));
     let delta = ben.recv().unwrap();
     assert_eq!(delta["code"], 1);
-    assert_eq!(delta["conversations"]["équipe"][0]["contents"], "hola ñ 😀");
+    assert_eq!(delta["conversations"]["equipe"][0]["contents"], "hola ñ 😀");
 
     ana.send(json!({"action":"logout"}));
     assert!(ana.recv().is_none(), "logout closes the connection");
@@ -272,5 +286,57 @@ fn a_message_sent_in_pieces_is_assembled() {
     client.stream.write_all(&request[15..]).unwrap();
     client.stream.write_all(&[EOT]).unwrap();
     assert_eq!(client.recv().unwrap()["msg"], "Authentication failed");
+    running.stop();
+}
+
+#[test]
+fn a_simple_and_a_full_client_share_a_chat() {
+    let running = start();
+    let mut full = running.client_v(2);
+    let mut simple = running.client_v(1);
+    full.register("ana");
+    simple.send(json!({"action":"create_user","username":"bob","password":"pw"}));
+    assert_eq!(
+        simple.recv().unwrap()["msg"],
+        "User added and logged in",
+        "a version 1 registration is a single reply"
+    );
+
+    full.send(json!({"action":"create_chat","chat_name":"duo","participants":["bob"]}));
+    assert_eq!(full.recv().unwrap()["msg"], "Chat created");
+    assert_eq!(simple.recv().unwrap(), json!({"chatname":"duo"}));
+
+    full.send(json!({"action":"send_msg","chat":"duo","msg":"café 😀"}));
+    assert_eq!(full.recv().unwrap()["msg"], "Message sent");
+    assert_eq!(simple.recv().unwrap()["contents"], "caf? ?");
+
+    simple.send(json!({"action":"send_msg","chat":"duo","msg":"plain ascii"}));
+    assert_eq!(simple.recv().unwrap()["msg"], "Message sent");
+    assert_eq!(full.recv().unwrap()["contents"], "plain ascii");
+
+    simple.send(json!({"action":"send_msg","chat":"duo","msg":"niño"}));
+    assert_eq!(
+        simple.recv().unwrap()["processed"],
+        0,
+        "a simple client cannot send non-ASCII text"
+    );
+    running.stop();
+}
+
+#[test]
+fn a_connection_must_say_hello_and_an_unknown_version_is_dropped() {
+    let running = start();
+    let mut silent = running.raw_client();
+    silent.send(json!({"action":"login","username":"ana","password":"pw"}));
+    assert_eq!(
+        silent.recv().unwrap()["msg"],
+        "Say hello with your protocol version first"
+    );
+
+    let mut future = running.raw_client();
+    future.send(json!({"action":"hello","version":9}));
+    let reply = future.recv().unwrap();
+    assert_eq!(reply["supported"], json!([1, 2]));
+    assert!(future.recv().is_none(), "the server closes the connection");
     running.stop();
 }
