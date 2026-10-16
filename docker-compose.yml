@@ -1,0 +1,30 @@
+# Local MySQL for development and the end-to-end tests.
+#
+#   docker compose up -d --wait     # start and wait until it accepts connections
+#   docker compose down -v          # stop and delete the data
+#
+# The host port is 3323 (3306 + 17, override with CHAT_DB_PORT): not the MySQL default, so it
+# never clashes with a MySQL you may already run on 3306. The credentials are for local use only.
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: chat-app-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: chat_root_dev
+      MYSQL_DATABASE: chat_app
+      MYSQL_USER: chat
+      MYSQL_PASSWORD: chat_dev
+    ports:
+      - "${CHAT_DB_PORT:-3323}:3306"
+    volumes:
+      - chat-app-mysql-data:/var/lib/mysql
+      - ./shared/database.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-pchat_root_dev"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  chat-app-mysql-data:

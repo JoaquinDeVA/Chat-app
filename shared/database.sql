@@ -1,43 +1,36 @@
--- Configuración de la Base de Datos para Chat Centralizado
-CREATE DATABASE IF NOT EXISTS chat_app;
+-- Schema of the chat database. Loaded automatically by docker-compose.yml; to load it by hand:
+--   mysql -u root -p < shared/database.sql
+CREATE DATABASE IF NOT EXISTS chat_app CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 USE chat_app;
 
--- 1. Tabla de Usuarios
--- La contraseña se define amplia para soportar hashes (BCrypt/Argon2)
-CREATE TABLE usuarios (
-    id_usuario INT AUTO_INCREMENT PRIMARY KEY,
-    nombre_usuario VARCHAR(50) NOT NULL UNIQUE,
-    contraseña VARCHAR(255) NOT NULL
+CREATE TABLE users (
+    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+    username      VARCHAR(50)  NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL          -- BCrypt hash (60 characters)
 ) ENGINE=InnoDB;
 
--- 2. Tabla de Chats (Salas)
 CREATE TABLE chats (
-    id_chat INT AUTO_INCREMENT PRIMARY KEY,
-    nombre_chat VARCHAR(100) UNIQUE
+    id   BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL UNIQUE
 ) ENGINE=InnoDB;
 
--- 3. Tabla Intermedia: Participantes
--- Relaciona Usuarios con Chats (N:N)
-CREATE TABLE participantes (
-    id_usuario INT NOT NULL,
-    id_chat INT NOT NULL,
-    fecha_union DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (id_usuario, id_chat),
-    FOREIGN KEY (id_usuario) REFERENCES usuarios(id_usuario) ON DELETE CASCADE,
-    FOREIGN KEY (id_chat) REFERENCES chats(id_chat) ON DELETE CASCADE
+-- Many-to-many relation between users and chats
+CREATE TABLE chat_members (
+    user_id   BIGINT   NOT NULL,
+    chat_id   BIGINT   NOT NULL,
+    joined_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, chat_id),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
--- 4. Tabla de Mensajes
--- id_autor vincula quién lo escribió, id_chat vincula dónde se escribió
-CREATE TABLE mensajes (
-    id_mensaje INT AUTO_INCREMENT PRIMARY KEY,
-    id_chat INT NOT NULL,
-    id_autor INT NOT NULL,
-    contenido TEXT NOT NULL,
-    fecha_envio DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (id_chat) REFERENCES chats(id_chat) ON DELETE CASCADE,
-    FOREIGN KEY (id_autor) REFERENCES usuarios(id_usuario) ON DELETE CASCADE
+CREATE TABLE messages (
+    id        BIGINT AUTO_INCREMENT PRIMARY KEY,
+    chat_id   BIGINT   NOT NULL,
+    author_id BIGINT   NOT NULL,
+    content   TEXT     NOT NULL,
+    sent_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (chat_id)   REFERENCES chats(id) ON DELETE CASCADE,
+    FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE,
+    INDEX idx_messages_chat_sent (chat_id, sent_at)   -- history and delta queries
 ) ENGINE=InnoDB;
-
--- Índice para optimizar la reconstrucción del historial en el servidor
-CREATE INDEX idx_chat_fecha ON mensajes(id_chat, fecha_envio);
