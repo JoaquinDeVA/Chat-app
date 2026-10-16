@@ -1,4 +1,5 @@
 from chat_client import __main__ as entry
+from chat_client.config import ServerAddress
 
 
 def test_main_builds_the_app_runs_it_and_always_cleans_up(monkeypatch):
@@ -20,7 +21,7 @@ def test_main_builds_the_app_runs_it_and_always_cleans_up(monkeypatch):
     monkeypatch.setattr(
         entry,
         "resolve_address",
-        lambda: entry.resolve_address.__wrapped__ if False else type("A", (), {"host": "h", "port": 1})(),
+        lambda: ServerAddress("h", 1),
     )
     assert entry.main() == 0
     assert events == [("init", "h", 1), "run", "cleanup"]
