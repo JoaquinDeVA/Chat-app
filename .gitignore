@@ -1,30 +1,33 @@
-# ── Backend Java ─────────────────────────────────────────────────────────────
+# ── Java backend ─────────────────────────────────────────────────────────────
 backend-java/target/
-
-# Local development configuration with real credentials — never commit this
+# Local credentials: never commit
 backend-java/src/main/resources/application-dev.properties
 backend-java/src/main/resources/application-prod.properties
 
-# ── Server Rust ───────────────────────────────────────────────────────────────
+# ── Rust server ──────────────────────────────────────────────────────────────
 server-rust/target/
-server-rust/Cargo.lock
 
-# ── Client C ─────────────────────────────────────────────────────────────────
-client-c/cli7
+# ── C client ─────────────────────────────────────────────────────────────────
 client-c/*.o
+client-c/chat-client
+client-c/tests/run_tests
 
-# ── Client Python ─────────────────────────────────────────────────────────────
-client-python/__pycache__/
-client-python/*.pyc
+# ── Python client ────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+# Conversations and images stored locally by the client
 client-python/chats/
 
-# ── Scratch / dev-only files ──────────────────────────────────────────────────
+# ── Local configuration and notes ────────────────────────────────────────────
+.env
 dev.txt
 
-# ── Claude Code local settings ────────────────────────────────────────────────
+# ── Editors, OS, tools ───────────────────────────────────────────────────────
+.idea/
+.vscode/
 .claude/
-
-# ── OS / editor ───────────────────────────────────────────────────────────────
 .DS_Store
 *.swp
 *.swo

@@ -1,33 +1,51 @@
-mod db;
-mod server;
-use crate::server::run;
-use std::sync::mpsc::{self,Sender};
-use std::sync::OnceLock;
+//! Chat relay server: `chat-server`. Configuration comes from environment variables, see
+//! [`chat_server::config::Config`].
 
-// Create a global storage for the sender
-static PANIC_TX: OnceLock<Sender<&'static str>> = OnceLock::new();
+use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-fn main() {
-    let (tx, rx) = mpsc::channel();
+use chat_server::backend::TcpBackend;
+use chat_server::config::Config;
+use chat_server::server::Server;
 
-    // 1. Store a clone of the sender in the global OnceLock
-    PANIC_TX.set(tx.clone()).expect("Failed to set global sender");
+fn main() -> ExitCode {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // 2. Handle Ctrl+C
-    let tx_ctrlc = tx.clone();
-    ctrlc::set_handler(move || {
-        println!("\nShutdown signal received (Ctrl+C)...");
-        let _ = tx_ctrlc.send("shutdown"); 
-    }).expect("Error setting Ctrl-C handler");
-
-    // 3. Handle Panics
-    std::panic::set_hook(Box::new(|info| {
-        eprintln!("Critical failure: {}", info);
-        // Access the global sender to signal the server loop
-        if let Some(tx) = PANIC_TX.get() {
-            let _ = tx.send("shutdown");
+    let config = match Config::from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            log::error!("{error}");
+            return ExitCode::from(2);
         }
-    }));
+    };
 
-    run("0.0.0.0:6969", rx);
+    let backend = match TcpBackend::connect(&config.backend_addr()) {
+        Ok(backend) => backend,
+        Err(error) => {
+            log::error!(
+                "cannot reach the backend at {}: {error} (is it running?)",
+                config.backend_addr()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut server = match Server::bind(&config.listen_addr(), backend) {
+        Ok(server) => server,
+        Err(error) => {
+            log::error!("cannot listen on {}: {error}", config.listen_addr());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&shutdown);
+    if let Err(error) = ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst)) {
+        log::error!("cannot install the Ctrl+C handler: {error}");
+        return ExitCode::FAILURE;
+    }
+
+    server.serve(&shutdown);
+    ExitCode::SUCCESS
 }
