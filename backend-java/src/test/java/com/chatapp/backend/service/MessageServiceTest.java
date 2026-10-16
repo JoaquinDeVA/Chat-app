@@ -115,7 +115,7 @@ class MessageServiceTest {
     Map<String, List<MessageView>> result = service.conversationsSince("ana", "2026-05-04 10:00:00");
 
     assertThat(result).containsOnlyKeys("team", "quiet");
-    assertThat(result.get("team")).containsExactly(new MessageView("team", "ana", "hi", "2026-05-04 10:30:05"));
+    assertThat(result.get("team")).containsExactly(new MessageView("team", "ana", "hi", "2026-05-04 10:30:05.000000"));
     assertThat(result.get("quiet")).isEmpty();
   }
 
@@ -126,5 +126,34 @@ class MessageServiceTest {
     assertThat(service.conversationsSince("ghost", "2026-05-04 10:00:00")).isEmpty();
     assertThat(service.conversationsSince("ana", "nonsense")).isEmpty();
     assertThat(service.conversationsSince(null, "2026-05-04 10:00:00")).isEmpty();
+  }
+
+  @Test
+  void timestampsKeepMicrosecondsSoThatMessagesOfTheSameSecondAreNeverLost() {
+    when(users.findByUsername("ana")).thenReturn(Optional.of(ana));
+    when(chats.findByName("team")).thenReturn(Optional.of(team));
+    when(members.findUsersOf(team)).thenReturn(List.of(ana));
+
+    assertThat(service.addMessage("ana", "team", "a", "2026-05-04 10:30:00.123456")).isTrue();
+    assertThat(service.addMessage("ana", "team", "b", "2026-05-04 10:30:00.5")).isTrue();
+    assertThat(service.addMessage("ana", "team", "c", "2026-05-04 10:30:00")).isTrue();
+
+    ArgumentCaptor<Message> saved = ArgumentCaptor.forClass(Message.class);
+    verify(messages, org.mockito.Mockito.times(3)).save(saved.capture());
+    assertThat(saved.getAllValues())
+        .extracting(Message::getSentAt)
+        .containsExactly(
+            LocalDateTime.of(2026, 5, 4, 10, 30, 0, 123_456_000),
+            LocalDateTime.of(2026, 5, 4, 10, 30, 0, 500_000_000),
+            LocalDateTime.of(2026, 5, 4, 10, 30, 0));
+
+    Message shown = new Message(team, ana, "x", LocalDateTime.of(2026, 5, 4, 10, 30, 0, 123_456_000));
+    when(members.findChatsOf(ana)).thenReturn(List.of(team));
+    when(messages.findByChatAndSentAtAfterOrderBySentAtAscIdAsc(
+            team, LocalDateTime.of(2026, 5, 4, 10, 30, 0, 123_455_000)))
+        .thenReturn(List.of(shown));
+    assertThat(service.conversationsSince("ana", "2026-05-04 10:30:00.123455").get("team"))
+        .extracting(MessageView::sent)
+        .containsExactly("2026-05-04 10:30:00.123456");
   }
 }

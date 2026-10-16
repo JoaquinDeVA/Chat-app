@@ -121,7 +121,7 @@ class ProtocolConfigTest {
     assertThat(dispatcher.dispatch("LOADMESSAGEDELTA{\"username\":\"ana\",\"since\":\"2026-05-04 10:00:00\"}"))
         .isEqualTo(
             "{\"conversations\":{\"team\":[{\"chatname\":\"team\",\"author\":\"ana\","
-                + "\"contents\":\"hi\",\"sent\":\"2026-05-04 10:30:05\"}],\"quiet\":[]}}");
+                + "\"contents\":\"hi\",\"sent\":\"2026-05-04 10:30:05.000000\"}],\"quiet\":[]}}");
   }
 
   @Test

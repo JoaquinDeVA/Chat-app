@@ -18,7 +18,7 @@ from .session import AppSession, Message
 
 log = logging.getLogger(__name__)
 
-TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S.%f"  # microseconds, like the server
 
 
 def _now() -> str:

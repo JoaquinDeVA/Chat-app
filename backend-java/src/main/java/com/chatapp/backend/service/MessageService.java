@@ -10,7 +10,9 @@ import com.chatapp.backend.repository.MessageRepository;
 import com.chatapp.backend.repository.UserRepository;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeFormatterBuilder;
 import java.time.format.DateTimeParseException;
+import java.time.temporal.ChronoField;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -22,8 +24,26 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 public class MessageService {
 
-  /** Timestamp format of the protocol. */
-  public static final DateTimeFormatter TIMESTAMP = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+  /**
+   * Timestamps of the protocol: {@code yyyy-MM-dd HH:mm:ss}, optionally with up to six fraction
+   * digits. Messages are sent and read back with microseconds, because the history is
+   * synchronized with "everything after this timestamp": with whole seconds, a message sent in
+   * the same second as the last one a client has seen would never be delivered.
+   */
+  private static final DateTimeFormatter PARSER =
+      new DateTimeFormatterBuilder()
+          .appendPattern("yyyy-MM-dd HH:mm:ss")
+          .optionalStart()
+          .appendFraction(ChronoField.MICRO_OF_SECOND, 1, 6, true)
+          .optionalEnd()
+          .toFormatter();
+
+  /** Format of the timestamps sent to clients: always six fraction digits. */
+  public static final DateTimeFormatter TIMESTAMP =
+      new DateTimeFormatterBuilder()
+          .appendPattern("yyyy-MM-dd HH:mm:ss")
+          .appendFraction(ChronoField.MICRO_OF_SECOND, 6, 6, true)
+          .toFormatter();
 
   private final MessageRepository messages;
   private final ChatRepository chats;
@@ -100,7 +120,7 @@ public class MessageService {
 
   private static LocalDateTime parse(String timestamp) {
     try {
-      return timestamp == null ? null : LocalDateTime.parse(timestamp, TIMESTAMP);
+      return timestamp == null ? null : LocalDateTime.parse(timestamp, PARSER);
     } catch (DateTimeParseException e) {
       return null;
     }

@@ -1,12 +1,24 @@
-JAVA_JAR   = backend-java/target/chat-0.0.1-SNAPSHOT.jar
-RUST_BIN   = server-rust/target/release/serv7
+# Chat app: build, test and run every component. `make help` lists the targets.
 
-# ── Build ────────────────────────────────────────────────────────────────────
+JAR        = backend-java/target/chat-backend-1.0.0.jar
+SERVER_BIN = server-rust/target/release/chat-server
+PYTHON    ?= python3
 
+help:
+	@echo "make build            build the backend, the server and the C client"
+	@echo "make test             unit tests of the four components (no database needed)"
+	@echo "make e2e              end-to-end test: MySQL in Docker + backend + server + clients"
+	@echo "make up | down        start / stop (and wipe) the MySQL container (host port 3323)"
+	@echo "make run-backend      run the Java backend            (terminal 1, after 'make up')"
+	@echo "make run-server       run the Rust server             (terminal 2)"
+	@echo "make run-client       run the Python client (v2)      (terminal 3)"
+	@echo "make run-client-c     run the C client (v1)           (terminal 3)"
+
+# ── build ────────────────────────────────────────────────────────────────────────────────────
 build: build-backend build-server build-client-c
 
 build-backend:
-	cd backend-java && mvn package -DskipTests -q
+	cd backend-java && mvn -q package -DskipTests
 
 build-server:
 	cd server-rust && cargo build --release --quiet
@@ -14,33 +26,49 @@ build-server:
 build-client-c:
 	$(MAKE) -C client-c
 
-# ── Run (open each in its own terminal) ──────────────────────────────────────
+# ── tests ────────────────────────────────────────────────────────────────────────────────────
+test: test-backend test-server test-client-python test-client-c
 
+test-backend:
+	cd backend-java && mvn -q test
+
+test-server:
+	cd server-rust && cargo test --quiet
+
+test-client-python:
+	cd client-python && $(PYTHON) -m pytest -q
+
+test-client-c:
+	$(MAKE) -C client-c test
+
+e2e: build-backend build-server
+	$(PYTHON) -m pytest tests/e2e -q
+
+# ── MySQL (docker-compose.yml) ───────────────────────────────────────────────────────────────
+up:
+	docker compose up -d --wait
+
+down:
+	docker compose down -v
+
+# ── run ──────────────────────────────────────────────────────────────────────────────────────
 run-backend:
-	java -jar $(JAVA_JAR) --spring.profiles.active=dev
+	java -jar $(JAR)
 
 run-server:
-	./$(RUST_BIN)
+	./$(SERVER_BIN)
 
-run-client-python:
-	cd client-python && python3 main.py
+run-client:
+	cd client-python && $(PYTHON) -m chat_client
 
 run-client-c:
-	cd client-c && ./cli7
+	./client-c/chat-client
 
-# ── Clean ────────────────────────────────────────────────────────────────────
-
-clean: clean-backend clean-server clean-client-c
-
-clean-backend:
-	cd backend-java && mvn clean -q
-
-clean-server:
-	rm -rf server-rust/target server-rust/Cargo.lock
-
-clean-client-c:
+clean:
+	cd backend-java && mvn -q clean
+	cd server-rust && cargo clean
 	$(MAKE) -C client-c clean
 
-.PHONY: build build-backend build-server build-client-c \
-        run-backend run-server run-client-python run-client-c \
-        clean clean-backend clean-server clean-client-c
+.PHONY: help build build-backend build-server build-client-c test test-backend test-server \
+        test-client-python test-client-c e2e up down run-backend run-server run-client \
+        run-client-c clean

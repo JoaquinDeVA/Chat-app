@@ -26,7 +26,9 @@ pub type ClientId = u64;
 /// Largest message a client may send (images travel inside messages).
 pub const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
-const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+/// `yyyy-MM-dd HH:mm:ss.ffffff`: microseconds, so that the history can be synchronized with
+/// "everything after this timestamp" without ever skipping a message sent in the same second.
+const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.6f";
 
 struct Session<W> {
     writer: W,
@@ -1336,5 +1338,14 @@ mod tests {
         assert_eq!(full[1]["contents"], "[[img]]|.png|AAAA");
         assert_eq!(simple[0]["contents"], "?and?");
         assert_eq!(simple[1]["contents"], "[image]");
+    }
+
+    #[test]
+    fn the_real_clock_stamps_with_microseconds() {
+        let mut server: Sessions<FakeBackend, Wire> = Sessions::new(FakeBackend::default());
+        let stamp = (server.clock)();
+        assert_eq!(stamp.len(), 26, "{stamp}");
+        assert!(chrono::NaiveDateTime::parse_from_str(&stamp, "%Y-%m-%d %H:%M:%S%.f").is_ok());
+        server.shutdown_backend();
     }
 }

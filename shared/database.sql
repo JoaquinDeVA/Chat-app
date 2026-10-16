@@ -28,8 +28,8 @@ CREATE TABLE messages (
     id        BIGINT AUTO_INCREMENT PRIMARY KEY,
     chat_id   BIGINT   NOT NULL,
     author_id BIGINT   NOT NULL,
-    content   TEXT     NOT NULL,
-    sent_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    content   MEDIUMTEXT NOT NULL,                      -- up to 16 MB: images travel inside messages
+    sent_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),   -- microseconds: the sync cursor
     FOREIGN KEY (chat_id)   REFERENCES chats(id) ON DELETE CASCADE,
     FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE,
     INDEX idx_messages_chat_sent (chat_id, sent_at)   -- history and delta queries

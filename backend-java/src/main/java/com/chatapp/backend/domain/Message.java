@@ -27,7 +27,7 @@ public class Message {
   @JoinColumn(name = "author_id")
   private User author;
 
-  @Column(nullable = false, columnDefinition = "TEXT")
+  @Column(nullable = false, columnDefinition = "MEDIUMTEXT")
   private String content;
 
   @Column(name = "sent_at", nullable = false)
