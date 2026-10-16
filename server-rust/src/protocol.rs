@@ -68,6 +68,9 @@ pub struct StatusReply {
     pub processed: u8,
     /// Human-readable detail.
     pub msg: String,
+    /// For a stored message: the time the server stamped it with (`yyyy-MM-dd HH:mm:ss`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent: Option<String>,
 }
 
 impl StatusReply {
@@ -76,6 +79,7 @@ impl StatusReply {
         StatusReply {
             processed: 1,
             msg: msg.to_owned(),
+            sent: None,
         }
     }
 
@@ -84,7 +88,14 @@ impl StatusReply {
         StatusReply {
             processed: 0,
             msg: msg.to_owned(),
+            sent: None,
         }
+    }
+
+    /// The same reply carrying the timestamp of the stored message.
+    pub fn with_sent(mut self, sent: &str) -> Self {
+        self.sent = Some(sent.to_owned());
+        self
     }
 }
 

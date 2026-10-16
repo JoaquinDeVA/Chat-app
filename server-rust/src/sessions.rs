@@ -269,7 +269,7 @@ impl<B: Backend, W: Write> Sessions<B, W> {
                 let message = ChatMessage {
                     author: user.to_owned(),
                     contents: text.to_owned(),
-                    sent,
+                    sent: sent.clone(),
                     chatname: chat.to_owned(),
                 };
                 match self.backend.chat_members(chat) {
@@ -278,7 +278,7 @@ impl<B: Backend, W: Write> Sessions<B, W> {
                         log::warn!("message stored but members of '{chat}' unknown: {error}")
                     }
                 }
-                self.reply(id, &StatusReply::ok("Message sent"))
+                self.reply(id, &StatusReply::ok("Message sent").with_sent(&sent))
             }
             Ok(false) => self.reply(id, &StatusReply::error("Could not send message")),
             Err(error) => self.backend_failed(id, &error),
@@ -724,6 +724,11 @@ mod tests {
 
         let pushed = json!({"author":"ana","contents":"hola ñ 😀","sent":"2026-05-04 10:30:00","chatname":"team"});
         assert_eq!(status(&ana.messages()[0]), (1, "Message sent"));
+        assert_eq!(
+            ana.messages()[0]["sent"],
+            "2026-05-04 10:30:00",
+            "the sender learns the timestamp"
+        );
         assert_eq!(ben.messages(), vec![pushed.clone()]);
         assert_eq!(
             ben_phone.messages(),
