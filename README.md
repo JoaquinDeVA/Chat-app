@@ -1,460 +1,168 @@
-# Ecosistema del repositorio
+# Chat
 
-Este repositorio contiene el ecosistema completo del chat: dos clientes TUI (Python y C), servidor intermediario en Rust, backend Java como capa de aplicación y MySQL como base de datos.
+A terminal chat made of four programs in four languages that talk through small, documented
+protocols: two terminal clients (Python and C), a relay server in Rust and an application backend in Java
+on top of MySQL.
 
-```
-Cliente Python ──┐
-                 ├──TCP:6969──► Servidor Rust ──TCP:9090──► Backend Java ──JDBC──► MySQL
-Cliente C      ──┘
-```
+[![CI](https://github.com/JoaquinDeVA/Chat-app/actions/workflows/ci.yml/badge.svg)](../../actions/workflows/ci.yml)
+![License](https://img.shields.io/badge/license-MIT-green)
 
-Ver el fichero [INSTALL](INSTALL) para instrucciones de instalación, compilación y ejecución.
+## Table of contents
 
----
+- [Overview](#overview)
+- [Features](#features)
+- [Architecture](#architecture)
+- [Quick start](#quick-start)
+- [Ports and configuration](#ports-and-configuration)
+- [Protocol versions](#protocol-versions)
+- [Project structure](#project-structure)
+- [Testing](#testing)
+- [Security notes](#security-notes)
+- [Roadmap](#roadmap)
+- [Authors](#authors)
+- [License](#license)
 
-# Cliente Python (TUI)
+## Overview
 
-## Descripción general
+Each layer has one job and a protocol of its own:
 
-Aplicación de mensajería de terminal (TUI) escrita en Python 3 con `curses`. Se conecta al servidor Rust por TCP, envía peticiones JSON y recibe respuestas y mensajes push en tiempo real. Los mensajes se guardan localmente por usuario para permitir historial offline y sincronización incremental al iniciar sesión.
+| Layer | Language | Job |
+|---|---|---|
+| Client (full) | Python, `curses` | Complete interface: Unicode, images, local history |
+| Client (simple) | C, `ncurses` | Minimal interface: plain ASCII text |
+| Relay server | Rust | Sessions, login, push notifications, protocol versions |
+| Backend | Java, Spring Data | Business rules and persistence |
+| Database | MySQL 8 | Users, chats, memberships, messages |
 
-## Ejecución
+It was written for a university course on distributed programming and then reworked into a tested,
+documented project.
 
-```bash
-cd client-python
-python3 main.py
-```
+## Features
 
-## Módulos
+- Registration and login (passwords are hashed with BCrypt).
+- Group chats; members that are online are notified of new chats and messages at once.
+- History is synchronized incrementally (only what is newer than the last message a client has).
+- **Two protocol versions** chosen by each client when it connects, so a simple client and a full one can
+  share a chat: the simple one sees text only (images appear as `[image]`, non-ASCII characters as `?`).
+- Images and any Unicode text in the Python client.
+- Conversations and images are also kept locally by the Python client.
 
-| Módulo | Responsabilidad |
-|---|---|
-| `main.py` | Controlador principal; máquina de estados AUTH → LIVE → EXIT |
-| `tui.py` | Capa de presentación curses (lista de chats, mensajes, entrada) |
-| `api_client.py` | Abstracción sobre el protocolo; un método por operación |
-| `network.py` | Cliente TCP con hilo receptor en segundo plano y cola interna |
-| `protocol.py` | Constructores de mensajes JSON y parser de respuestas |
-| `app_state.py` | Modelos de estado: enums de pantalla y sesión en memoria |
-| `persistence.py` | Lectura/escritura de conversaciones en `./chats/<usuario>/` |
-| `images.py` | Encode/decode de imágenes; gestión de UUIDs locales y refs |
-| `config.py` | Lectura de `config.txt` |
-
-## Funcionalidades
-
-- Login y registro de usuario con contraseña oculta (Tab para mostrar/ocultar)
-- Navegación entre chats con ↑/↓
-- Envío de mensajes con ENTER
-- Creación de chats de grupo con la tecla `n`
-- Sincronización incremental al iniciar sesión (`LOADMESSAGEDELTA`)
-- Indicador `◆` verde en chats con mensajes no leídos recibidos por push
-- Historial local persistente en `./chats/<usuario>/` con sincronización incremental vía `last_sync.txt`
-- Mensajes fallidos marcados con `[FALLIDO]` en rojo
-- Envío de imágenes: escribe la ruta del fichero como mensaje (`.jpg`, `.jpeg`, `.png`, `.gif`, `.webp`)
-- Cada cliente genera un UUID local para cada imagen recibida o enviada; el UUID no viaja por red
-- Imágenes guardadas en `./chats/<usuario>/images/` y visualizadas como `[imagen: uuid.ext]`
-- Selector de imágenes con la tecla `o`; se abre con `xdg-open` (Linux) o `open` (macOS)
-
-## Base de datos
-
-La base de datos se define en [shared/database.sql](shared/database.sql) y se compone de cuatro tablas principales: Usuarios, Chats, Participantes y Mensajes.
-
-### Diagrama UML (modelo relacional)
-![Description](assets/nosotros.jpg)
-```mermaid
-classDiagram
-  class Usuarios {
-    +INT id_usuario PK
-    +VARCHAR(50) nombre_usuario UNIQUE
-    +VARCHAR(255) contrasena
-  }
-
-  class Chats {
-    +INT id_chat PK
-    +VARCHAR(100) nombre_chat
-  }
-
-  class Participantes {
-    +INT id_usuario PK, FK
-    +INT id_chat PK, FK
-    +DATETIME fecha_union
-  }
-
-  class Mensajes {
-    +INT id_mensaje PK
-    +INT id_chat FK
-    +INT id_autor FK
-    +TEXT contenido
-    +DATETIME fecha_envio
-  }
-
-  Usuarios "1" --> "0..*" Participantes : participa_en
-  Chats "1" --> "0..*" Participantes : tiene_participantes
-  Chats "1" --> "0..*" Mensajes : contiene
-  Usuarios "1" --> "0..*" Mensajes : escribe
-```
-
-# Cliente C (TUI ncurses)
-
-## Descripción general
-
-Cliente de mensajería de terminal escrito en C con `ncurses`. Implementa el mismo protocolo JSON + EOT que el cliente Python y se conecta al mismo servidor Rust.
-
-La orientación del cliente C es diferente a la del Python: no pretende alcanzar el mismo conjunto de funcionalidades, sino ofrecer una alternativa de más bajo nivel, con menor consumo de recursos y sin dependencias de intérprete. El desarrollo futuro del cliente C iría ampliando sus capacidades progresivamente dentro de esa misma filosofía, sin converger necesariamente con la versión Python.
-
-## Ejecución
-
-```bash
-cd client-c
-./cli7
-```
-
-## Módulos
-
-| Fichero | Responsabilidad |
-|---|---|
-| `main.c` | Controlador principal; máquina de estados AUTH → LIVE → EXIT |
-| `tui.c/h` | Capa de presentación ncurses (lista de chats, mensajes, entrada) |
-| `network.c/h` | Cliente TCP con hilo receptor en segundo plano y cola circular |
-| `protocol.c/h` | Constructores de mensajes JSON y parsers mínimos |
-| `app_state.c/h` | Sesión en memoria: chats y mensajes (arrays estáticos) |
-
-## Funcionalidades implementadas
-
-- Login y registro de usuario
-- Navegación entre chats con ↑/↓
-- Envío de mensajes de texto con ENTER
-- Creación de chats de grupo con la tecla `n`
-- Recepción de mensajes push en tiempo real
-- Sincronización incremental al iniciar sesión (`load_message_delta`)
-
-## No implementado
-
-- Envío y recepción de imágenes
-- Persistencia local entre sesiones (sin caché en disco)
-- Indicador de mensajes no leídos
-- Scroll en el historial de mensajes
-- Ocultar/mostrar contraseña durante el login
-
-# Backend Java 
-
-## Descripcion general
-Este backend en Java encapsula la lógica relacionada a la BBDD y expone una serie de llamadas predifinidas para que las use el servidor asociado. La persistencia se realiza sobre MySQL, manteniendo el estado de usuarios, chats y mensajes en una base de datos centralizada.
-
-La arquitectura sigue la siguiente lógica: Controller -> Service -> Repository.
-
-
-## Flujo request
-
-### Controller
-
-Recibe la peticion y hace la traduccion a formato interno. Para ello usa los DTO y, una vez terminado, pasa a llamar al servicio.
-
-### Service
-
-Realiza todo el código que puede estar relacionada a la peticion. Contrains, calculo de terceros parámetros, etc...
-El mapping de resultado de la BBDD a los objetos internos.
-
-### Repository
-
-Una vez se ha preprocesado lo necesario el repository hace las peticiones necesarias a la BBDD.
-
-## Peticiones TCP soportadas
-
-El backend TCP espera mensajes con el formato:
-
-`<NombrePeticion>{...json...}<0x04>`
-
-Las peticiones actualmente soportadas por `TcpServerRunner` son:
-
-- `AuthRequest` → valida credenciales (`CheckPasswordRequestDTO`)
-- `AddUserRequest` → crea usuario (`AddUserRequestDTO`)
-- `CreateChatRequest` → crea chat y participantes (`AddChatRequestDTO`)
-- `SendMessageRequest` → guarda mensaje en un chat (`AddMessageRequestDTO`)
-- `LOADMESSAGEDELTA` → recupera mensajes posteriores a una fecha (`LoadMessageDeltaRequestDTO`)
-- `GETCHATMEMBERSREQUEST` → obtiene la lista de participantes de un chat
-
-
-## Arquitectura de datos
-- Base de datos centralizada en MySQL (InnoDB).
-- Entidades principales: Usuarios, Chats, Participantes, Mensajes.
+## Architecture
 
 ```mermaid
-erDiagram
-  USUARIOS ||--o{ PARTICIPANTES : participa
-  CHATS ||--o{ PARTICIPANTES : contiene
-  CHATS ||--o{ MENSAJES : tiene
-  USUARIOS ||--o{ MENSAJES : escribe
+flowchart LR
+    PY["Python client<br/>protocol v2"] -- "JSON + 0x04<br/>TCP 6969" --> RS
+    C["C client<br/>protocol v1"] -- "JSON + 0x04<br/>TCP 6969" --> RS
+    RS["Rust server<br/>sessions, push"] -- "Name{json} + 0x04<br/>TCP 9090" --> JB["Java backend<br/>services, JPA"]
+    JB -- "JDBC<br/>3323 → 3306" --> DB[("MySQL")]
 ```
 
+More detail, sequence diagrams and the data model are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md);
+the messages themselves are in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
+## Quick start
 
-### checkPassword - Comprueba las credenciales del usuario
+Requirements: Docker, Java 17+, Maven, Rust (stable), Python 3.11+, GCC and `libncurses-dev` (for the C
+client). The whole procedure is in [docs/INSTALL.md](docs/INSTALL.md).
 
-**Descripción**: Valida que el usuario existe y que la contraseña es correcta. Utiliza `CaesarCipher.matches()` para comparar la contraseña cifrada almacenada en la base de datos.
-
-**Flujo de operación**:
-1. Recibe el nombre de usuario y la contraseña
-2. Consulta la tabla USUARIOS por nombre_usuario
-3. Si el usuario existe: compara la contraseña cifrada con `CaesarCipher.matches(plain, stored)`
-4. Retorna `authorized: true` si es correcto, `authorized: false` en caso contrario
-
-**Tablas implicadas**: USUARIOS
-
-**RequestDTO**: `CheckPasswordRequestDTO`
-```json
-{
-  "username": "maria",
-  "password": "secreto"
-}
-```
-
-**ResponseDTO**: `CheckPasswordResponseDTO`
-```json
-{
-  "authorized": true
-}
-```
-
----
-
-### addUser - Añade un nuevo usuario a la base de datos
-
-**Descripción**: Crea un nuevo usuario con su contraseña hasheada. Verifica primero que el nombre de usuario no existe para evitar duplicados.
-
-**Flujo de operación**:
-1. Recibe nombre de usuario y contraseña
-2. Consulta la tabla USUARIOS para verificar que el nombre_usuario no existe
-3. Si ya existe: retorna `processed: false`
-4. Si no existe: 
-   - Cifra la contraseña con `CaesarCipher.encrypt()`
-   - Inserta nuevo registro en USUARIOS con nombre_usuario y contraseña hasheada
-   - Retorna `processed: true`
-
-**Tablas implicadas**: USUARIOS
-
-**RequestDTO**: `AddUserRequestDTO`
-```json
-{
-  "username": "jorge",
-  "password": "atf28"
-}
-```
-
-**ResponseDTO**: `AddUserResponseDTO`
-```json
-{
-  "processed": true
-}
-```
-
----
-
-### addChat - Crea un chat y añade participantes
-
-**Descripción**: Crea un chat nuevo y vincula a los usuarios indicados como participantes iniciales.
-
-**Flujo de operación**:
-1. Recibe nombre de chat y lista de usuarios
-2. Valida que `chatname` no esté vacío y que `usernames` tenga al menos un elemento
-3. Verifica que no exista ya un chat con ese nombre
-4. Elimina duplicados y usuarios vacíos de la lista de participantes
-5. Comprueba que todos los usuarios existan en USUARIOS
-6. Crea el chat en CHATS
-7. Inserta un registro en PARTICIPANTES por cada usuario con `fecha_union = NOW()`
-8. Retorna `processed: true` si todo va bien
-
-**Tablas implicadas**: USUARIOS, CHATS, PARTICIPANTES
-
-**RequestDTO**: `AddChatRequestDTO`
-```json
-{
-  "chatname": "grupo-amigos",
-  "usernames": ["jorge", "alicia", "maria"]
-}
-```
-
-**ResponseDTO**: `AddChatResponseDTO`
-```json
-{
-  "processed": true
-}
-```
-
----
-
-### addMessage - Añade un nuevo mensaje al historial
-
-**Descripción**: Añade un mensaje a un chat ya existente.
-
-**Flujo de operación**:
-1. Recibe `username`, `chatname`, `message` y `date`
-2. Consulta USUARIOS para obtener id_usuario del emisor
-3. Busca el chat por `chatname`
-4. Si no existe el usuario o el chat: retorna `processed: false`
-5. Inserta registro en MENSAJES con:
-   - id_chat del chat encontrado
-   - id_autor del usuario emisor
-   - contenido con `message`
-   - fecha_envio parseada desde `date`
-6. Retorna `processed: true`
-
-**Tablas implicadas**: USUARIOS, CHATS, MENSAJES
-
-**Prerequisitos**: El usuario emisor y el chat deben existir.
-
-**RequestDTO**: `AddMessageRequestDTO`
-```json
-{
-  "username": "jorge",
-  "chatname": "grupo-amigos",
-  "message": "Que haces el viernes morena?",
-  "date": "2026-05-04 10:30:00"
-}
-```
-
-**ResponseDTO**: `AddMessageResponseDTO`
-```json
-{
-  "processed": true
-}
-```
-
----
-
-### loadConversations - Carga todas las conversaciones de un usuario
-
-**Descripción**: Devuelve un listado de todas las conversaciones del usuario con todos sus mensajes, organizadas por nombre de usuario del otro participante.
-
-**Flujo de operación**:
-1. Recibe nombre de usuario
-2. Consulta USUARIOS para obtener id_usuario
-3. Si no existe: retorna conversaciones vacío
-4. Consulta PARTICIPANTES para obtener todos los id_chat donde participa el usuario
-5. Para cada chat encontrado:
-   - Consulta MENSAJES para obtener todos los mensajes del chat (ordenados por fecha_envio ASC)
-   - Para cada mensaje: obtiene el nombre del autor desde su id_autor
-   - Agrupa los mensajes bajo la clave del nombre del chat
-6. Retorna estructura Map<chatname, List<MessageDTO>> donde cada MessageDTO contiene:
-   - chatname: nombre del chat
-   - author: nombre del usuario que escribió el mensaje
-   - contents: contenido del mensaje
-   - sent: timestamp en formato "yyyy-MM-dd HH:mm:ss"
-
-**Tablas implicadas**: USUARIOS, PARTICIPANTES, CHATS, MENSAJES
-
-**RequestDTO**: `LoadConversationsRequestDTO`
-```json
-{
-  "username": "alicia"
-}
-```
-
-**ResponseDTO**: `LoadConversationsResponseDTO`
-```json
-{
-  "conversations": {
-    "bob": [
-      {
-        "chatname": "bob",
-        "author": "alicia",
-        "contents": "Hola, ¿cómo estás?",
-        "sent": "2026-05-02 10:00:00"
-      },
-      {
-        "chatname": "bob",
-        "author": "bob",
-        "contents": "Todo bien, ¿y tú?",
-        "sent": "2026-05-02 10:05:00"
-      }
-    ],
-    "charlie": [
-      {
-        "chatname": "charlie",
-        "author": "charlie",
-        "contents": "Has visto los nuevos cambios?",
-        "sent": "2026-05-02 11:30:00"
-      },
-      {
-        "chatname": "charlie",
-        "author": "alicia",
-        "contents": "Sí, acabo de revisar el repo.",
-        "sent": "2026-05-02 11:32:00"
-      }
-    ]
-  }
-}
-```
-
-
----
-
-### loadMessageDelta - Carga mensajes nuevos desde una fecha
-
-**Descripción**: Devuelve todos los mensajes de los chats del usuario que sean posteriores a la fecha indicada. Usado por el cliente al iniciar sesión para sincronización incremental.
-
-**Flujo de operación**:
-1. Recibe `username` y `since` (formato `yyyy-MM-dd HH:mm:ss`)
-2. Obtiene todos los chats donde participa el usuario
-3. Para cada chat: consulta MENSAJES donde `fecha_envio > since`
-4. Devuelve el mapa de conversaciones con solo los mensajes nuevos
-
-**Tablas implicadas**: USUARIOS, PARTICIPANTES, CHATS, MENSAJES
-
-**RequestDTO**: `LoadMessageDeltaRequestDTO`
-```json
-{
-  "username": "alicia",
-  "since": "2026-05-01 00:00:00"
-}
-```
-
-**ResponseDTO**:
-```json
-{
-  "conversations": {
-    "grupo-amigos": [
-      {
-        "chatname": "grupo-amigos",
-        "author": "jorge",
-        "contents": "Que haces el viernes?",
-        "sent": "2026-05-02 10:30:00"
-      }
-    ]
-  }
-}
-```
-
-## Dependencias
-
-El proyecto utiliza Maven como gestor de dependencias. Las siguientes librerías son esenciales:
-
-| Dependencia | Versión | Propósito | Alcance |
-|---|---|---|---|
-| `spring-boot-starter-data-jpa` | 3.2.5 | Acceso a datos con JPA/Hibernate | compile |
-| `mysql-connector-j` | (inherited) | Driver JDBC para MySQL | runtime |
-| `org.projectlombok:lombok` | (inherited) | Generación automática de getters/setters | compile |
-| `spring-boot-starter-test` | 3.2.5 | Testing (JUnit5, Mockito) | test |
-| `com.fasterxml.jackson.core:jackson-databind` | (inherited via Spring Boot) | Serialización/deserialización JSON | compile |
-
-### Configuración de Maven
-
-Ejecutar los tests:
 ```bash
-mvn test
+make build         # backend jar, Rust server, C client
+make up            # MySQL in Docker, published on host port 3323
 ```
 
-Compilar el proyecto:
+Then, in three terminals:
+
 ```bash
-mvn clean compile
+make run-backend   # 1. the Java backend
+make run-server    # 2. the Rust server
+make run-client    # 3. the Python client (or: make run-client-c)
 ```
 
-Construir el JAR:
+> **MySQL runs on port 3323, not on the default 3306**, so it never clashes with a MySQL you already have.
+> To use another port: `CHAT_DB_PORT=3400 make up` and start the backend with
+> `CHAT_DB_URL=jdbc:mysql://localhost:3400/chat_app`.
+
+Keys in the clients: `↑`/`↓` change chat, `Enter` writes a message, `n` creates a chat, `q` quits, `Esc` cancels
+what you are typing. In the Python client, writing the path of an image file sends the image and `o` opens it.
+
+## Ports and configuration
+
+Everything is configured with environment variables (see [`.env.example`](.env.example)) and has a default.
+
+| What | Default | Variable |
+|---|---|---|
+| MySQL, published on the host | **3323** (container: 3306) | `CHAT_DB_PORT` |
+| Backend → database | `jdbc:mysql://localhost:3323/chat_app` | `CHAT_DB_URL`, `CHAT_DB_USER`, `CHAT_DB_PASSWORD` |
+| Rust server listens on | `127.0.0.1:6969` | `CHAT_SERVER_BIND`, `CHAT_SERVER_PORT` |
+| Rust server → backend | `127.0.0.1:9090` | `CHAT_BACKEND_HOST`, `CHAT_BACKEND_PORT` |
+| Clients → server | `127.0.0.1:6969` | `CHAT_SERVER_HOST`, `CHAT_SERVER_PORT` or `--host` / `--port` |
+
+## Protocol versions
+
+The first message of a connection is `{"action":"hello","version":N}`. Version 1 is for simple clients and
+version 2 for full ones; the server keeps one implementation of what differs and shares the rest.
+
+| | v1 (C client) | v2 (Python client) |
+|---|---|---|
+| Text sent | printable ASCII, up to 1000 characters | any text |
+| Images | not understood (shown as `[image]`) | supported |
+| Text received | non-ASCII characters shown as `?` | unchanged |
+| Registration | one reply, already logged in | two replies: result, then login |
+
+Names of users and chats are plain ASCII (letters, digits, `_`, `-`, `.`) in every version so that every
+client can type and show them. Details: [docs/PROTOCOL.md](docs/PROTOCOL.md).
+
+## Project structure
+
+```
+backend-java/     Spring Boot backend: domain, repositories, services, protocol, TCP server
+server-rust/      relay server: protocol, versions, sessions (logic), server (sockets), backend client
+client-python/    chat_client package: protocol, network, api, controller, curses screens
+client-c/         simple client: json, protocol, session, network, ncurses interface
+shared/           database schema (database.sql) and a data reset script
+tests/e2e/        end-to-end tests of the whole system
+docs/             architecture, protocol, installation
+docker-compose.yml  MySQL for development and tests
+```
+
+## Testing
+
 ```bash
-mvn package
+make test    # unit tests of the four components; no database needed
+make e2e     # MySQL (Docker) + backend + server + clients, 8 scenarios
 ```
 
----
+| Component | Tests |
+|---|---|
+| Java | 44 (services, protocol, TCP server, password hashing) |
+| Rust | 60 (protocol, every request with a fake backend, real sockets) |
+| Python | 110, 95% coverage (controller, network, curses screens with a fake terminal) |
+| C | 165 checks, also run under AddressSanitizer and UBSan |
+| End to end | 8 (registration, real-time chat, reconnection, images, simple + full client, shutdown) |
 
-## Seguridad
+## Security notes
 
-Las contraseñas se cifran con `CaesarCipher`: desplazamiento fijo de 47 posiciones sobre el rango de caracteres ASCII imprimibles (32–126). La clase `CaesarCipher` en `shared/util/` expone `encrypt(plain)` y `matches(plain, encrypted)`, que son los únicos puntos de acceso a credenciales en el backend.
+- Passwords are hashed with BCrypt before they are stored. While they travel (client → server → backend)
+  they are plain text on connections that are not encrypted, see the next point.
+- **The protocol is not encrypted.** The server therefore listens on `127.0.0.1` by default; set
+  `CHAT_SERVER_BIND=0.0.0.0` only on a trusted network. TLS is on the [roadmap](ROADMAP.md).
+- The author of a message is always the logged-in user of the connection, never a name sent by the client,
+  and only members of a chat can write in it.
+- The credentials in `docker-compose.yml` and `application.properties` are for local development only.
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md): end-to-end encryption, TLS, a third protocol version, and more.
+
+## Authors
+
+- Joaquín De Vicente Abad
+- [Pablo Corzo](https://github.com/PabloCorzo)
+- [Pilar Fernández Adillo](https://github.com/adillo8)
+
+Built together as the final practical of *Programación Distribuida* (CEU San Pablo University), and
+reworked afterwards.
+
+## License
+
+[MIT](LICENSE)
